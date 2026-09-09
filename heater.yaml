@@ -9,8 +9,19 @@ substitutions:
 
   # ---- Control térmico ----
   temp_target_default: "21.0"
+  temp_target_min: "18"
+  temp_target_max: "25"
   hysteresis: "0.4"       # °C (banda muerta)
   step_band: "0.4"        # °C por nivel (agresividad)
+
+  # ---- MQTT ----
+  mqtt_setpoint_topic: "ha/${name}/setpoint"
+  mqtt_discharge_topic: "ha/${name}/discharge"
+  mqtt_telemetry_topic: "ha/${name}/telemetry"
+
+  # ---- Estado de carga térmica ----
+  brick_temp_soc_min_default: "20.0"   # 0 % de carga
+  brick_temp_soc_max_default: "120.0"  # 100 % de carga; cerca del límite del DS18B20
 
   # ---- Endstops / Homing ----
   endstop_debounce: "30ms"
@@ -33,7 +44,7 @@ esphome:
           // Nivel a restaurar tras homing (en boot o recalibración)
           id(boot_restore_level) = lvl;
 
-          ESP_LOGW("BOOT", "Boot: homing a cerrado y luego restauro nivel=%d", lvl);
+          ESP_LOGW("BOOT", "Boot: homing a cerrado; AUTO_REMOTO esperara MQTT antes de abrir (nivel=%d)", lvl);
 
           // Bloquea auto/manual hasta terminar secuencia
           id(motion_state) = 1;  // 0=READY, 1=HOMING, 2=RESTORING
@@ -50,8 +61,6 @@ esp32:
 
 logger:
   level: DEBUG
-  logs:
-    wireguard: WARN
 
 api:
   encryption:
@@ -67,7 +76,6 @@ time:
     timezone: Europe/Madrid
 
 wifi:
-  use_address: ${wg_private_ip}
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   ap:
@@ -80,32 +88,130 @@ wifi:
 
 captive_portal:
 
-wireguard:
-  address: ${wg_private_ip}
-  private_key: !secret wg_private_key_heater
-  peer_endpoint: !secret wg_peer_endpoint
-  peer_port: !secret wg_peer_port
-  peer_public_key: !secret wg_peer_public_key
-  peer_preshared_key: !secret wg_preshared_key_heater
-  peer_allowed_ips:
-    - 10.8.0.0/24
-  peer_persistent_keepalive: !secret wg_peer_persistent_keepalive
-  netmask: 255.255.255.0
+# Reservado para una futura activación de WireGuard.
+# wireguard:
+#   address: ${wg_private_ip}
+#   private_key: !secret wg_private_key_heater
+#   peer_endpoint: !secret wg_peer_endpoint
+#   peer_port: !secret wg_peer_port
+#   peer_public_key: !secret wg_peer_public_key
+#   peer_preshared_key: !secret wg_preshared_key_heater
+#   peer_allowed_ips:
+#     - 10.8.0.0/24
+#   peer_persistent_keepalive: !secret wg_peer_persistent_keepalive
+#   netmask: 255.255.255.0
+
+mqtt:
+  id: mqtt_client
+  broker: !secret mqtt_broker
+  port: !secret mqtt_port
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  topic_prefix: null
+  discovery: false
+  reboot_timeout: 0s
+  on_connect:
+    - lambda: |-
+        id(last_telemetry_ms) = 0;
+        ESP_LOGI("MQTT", "Conectado al broker");
+    - script.execute: publish_remote_telemetry
+  on_disconnect:
+    - lambda: |-
+        id(remote_discharge_enabled) = false;
+        id(remote_setpoint_valid) = false;
+        id(last_auto_ms) = 0;
+        id(last_telemetry_ms) = 0;
+        ESP_LOGW("MQTT", "Broker desconectado: invalido estado remoto");
+    - script.execute: force_remote_close
+  on_message:
+    - topic: ${mqtt_setpoint_topic}
+      qos: 1
+      then:
+        - lambda: |-
+            char *end = nullptr;
+            const float value = strtof(x.c_str(), &end);
+            while (end != nullptr && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) {
+              end++;
+            }
+
+            if (end == x.c_str() || (end != nullptr && *end != '\0') || isnan(value) ||
+                value < atof("${temp_target_min}") || value > atof("${temp_target_max}")) {
+              id(remote_setpoint_valid) = false;
+              ESP_LOGW("MQTT", "Setpoint invalido: '%s'", x.c_str());
+              id(last_auto_ms) = 0;
+              return;
+            }
+
+            id(remote_temp_target) = value;
+            id(remote_setpoint_valid) = true;
+            id(remote_temp_target_sensor).publish_state(value);
+            id(last_auto_ms) = 0;
+            ESP_LOGI("MQTT", "Setpoint remoto=%.1f C", value);
+        - script.execute: force_remote_close
+
+    - topic: ${mqtt_discharge_topic}
+      qos: 1
+      then:
+        - lambda: |-
+            std::string payload = x;
+            for (char &c : payload) {
+              if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            }
+
+            if (payload == "OFF") {
+              id(remote_discharge_enabled) = false;
+              id(remote_setpoint_valid) = false;
+              id(last_auto_ms) = 0;
+              ESP_LOGW("MQTT", "Discharge remoto=OFF");
+              return;
+            }
+
+            if (payload == "ON") {
+              id(remote_discharge_enabled) = true;
+              id(last_auto_ms) = 0;
+              ESP_LOGI("MQTT", "Discharge remoto=ON (setpoint_valido=%s)",
+                       id(remote_setpoint_valid) ? "si" : "no");
+              return;
+            }
+
+            id(remote_discharge_enabled) = false;
+            id(remote_setpoint_valid) = false;
+            id(last_auto_ms) = 0;
+            ESP_LOGW("MQTT", "Discharge invalido: '%s'", x.c_str());
+        - script.execute: force_remote_close
 
 globals:
-  # Modos
-  - id: auto_mode
-    type: bool
-    restore_value: true
-    initial_value: "true"
-
+  # Debug mantiene el comportamiento anterior: sustituye las temperaturas
+  # medidas por las temperaturas simuladas.
   - id: debug_mode
     type: bool
     restore_value: true
     initial_value: "false"
 
+  # Estado recibido por MQTT en AUTO_REMOTO.
+  - id: remote_discharge_enabled
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: remote_setpoint_valid
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+  - id: remote_temp_target
+    type: float
+    restore_value: false
+    initial_value: "21.0"
+
   # Control AUTO (gating por periodo)
   - id: last_auto_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  # Telemetría MQTT (gating por periodo)
+  - id: last_telemetry_ms
     type: uint32_t
     restore_value: false
     initial_value: "0"
@@ -147,6 +253,13 @@ script:
           if (level < 0) level = 0;
           if (level > 5) level = 5;
 
+          // En AUTO_REMOTO, el estado MQTT remoto tiene prioridad y fuerza
+          // el nivel 0 mientras no haya permiso y setpoint válidos.
+          if (id(operating_mode).state == "AUTO_REMOTO" &&
+              (!id(remote_discharge_enabled) || !id(remote_setpoint_valid))) {
+            level = 0;
+          }
+
           const int steps5 = atoi("${steps_level_5}");
           const int target_steps = (int) lroundf(level * (steps5 / 5.0f));
 
@@ -156,8 +269,96 @@ script:
 
           id(saved_level) = level;
           id(level_reported).publish_state(level);
-          id(open_percent).publish_state((level * 100) / 5);
           id(level_manual).publish_state(level);
+
+  # Fuerza el cierre solo cuando el modo remoto no tiene permiso completo.
+  # Durante HOMING dejamos que el motor termine de buscar el final cerrado.
+  - id: force_remote_close
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(operating_mode).state != "AUTO_REMOTO") return;
+          if (id(remote_discharge_enabled) && id(remote_setpoint_valid)) return;
+
+          if (id(motion_state) == 1) {
+            ESP_LOGW("MQTT", "Cierre remoto pendiente: homing en curso");
+            return;
+          }
+
+          if (id(motor).current_position != 0 || id(motor).target_position != 0 || id(saved_level) != 0) {
+            ESP_LOGW("MQTT", "Cierre remoto forzado");
+            id(set_level)->execute(0);
+          }
+
+  # Calcula el estado de carga térmica a partir de la temperatura real de los
+  # ladrillos y de los dos límites configurables en Home Assistant.
+  - id: update_stored_soc
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(temp_ladrillos).has_state() || isnan(id(temp_ladrillos).state)) {
+            return;
+          }
+
+          const float temp_min = id(brick_temp_soc_min).state;
+          const float temp_max = id(brick_temp_soc_max).state;
+
+          if (isnan(temp_min) || isnan(temp_max) || temp_max <= temp_min) {
+            ESP_LOGE("SOC", "Limites SOC invalidos: min=%.1f max=%.1f", temp_min, temp_max);
+            id(stored_soc_percent).publish_state(NAN);
+            return;
+          }
+
+          float soc = ((id(temp_ladrillos).state - temp_min) / (temp_max - temp_min)) * 100.0f;
+          if (soc < 0.0f) soc = 0.0f;
+          if (soc > 100.0f) soc = 100.0f;
+
+          id(stored_soc_percent).publish_state(lroundf(soc));
+
+  # Publica la telemetría remota con valores físicos actuales.
+  - id: publish_remote_telemetry
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(operating_mode).state == "AUTO_REMOTO";'
+          then:
+            - if:
+                condition:
+                  lambda: 'return id(mqtt_client)->is_connected();'
+                then:
+                  - if:
+                      condition:
+                        lambda: |-
+                          return id(temp_room).has_state() && !isnan(id(temp_room).state) &&
+                                 id(stored_soc_percent).has_state() && !isnan(id(stored_soc_percent).state);
+                      then:
+                        - mqtt.publish_json:
+                            topic: ${mqtt_telemetry_topic}
+                            qos: 0
+                            retain: false
+                            payload: |-
+                              const int steps5 = atoi("${steps_level_5}");
+                              float damper_pct = 0.0f;
+                              if (steps5 > 0) {
+                                damper_pct = ((float) id(motor).current_position * 100.0f) / steps5;
+                              }
+                              if (damper_pct < 0.0f) damper_pct = 0.0f;
+                              if (damper_pct > 100.0f) damper_pct = 100.0f;
+
+                              root["indoor_temperature_c"] = lroundf(id(temp_room).state * 10.0f) / 10.0f;
+                              root["stored_soc_percent"] = (int) lroundf(id(stored_soc_percent).state);
+                              root["damper_position_percent"] = (int) lroundf(damper_pct);
+                      else:
+                        - logger.log:
+                            level: DEBUG
+                            tag: MQTT
+                            format: "Telemetria omitida: faltan sensores validos"
+                else:
+                  - logger.log:
+                      level: DEBUG
+                      tag: MQTT
+                      format: "Telemetria omitida: MQTT desconectado"
 
   # Ancla la posición interna del stepper (report_position + set_target) para evitar movimientos raros
   - id: anchor_steps
@@ -192,7 +393,8 @@ script:
                   return -(steps5 + extra);
 
   # Handler del endstop cerrado:
-  # - si estamos HOMING: ancla a 0 y RESTORE a boot_restore_level
+  # - en AUTO_REMOTO: termina en 0 y espera el permiso/setpoint MQTT
+  # - en otros modos: restaura boot_restore_level como antes
   # - si estamos en normal: ancla a 0 y fija nivel 0 (sin “restore”)
   - id: on_closed_endstop
     mode: restart
@@ -212,14 +414,26 @@ script:
           condition:
             lambda: 'return id(motion_state) == 1;'
           then:
-            - lambda: |-
-                const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-                id(motion_state) = 2; // RESTORING
-                id(motion_state_since_ms) = now;
-                ESP_LOGW("HOME", "Cerrado alcanzado -> restauro nivel=%d", id(boot_restore_level));
-            - script.execute:
-                id: set_level
-                lvl: !lambda 'return id(boot_restore_level);'
+            - if:
+                condition:
+                  lambda: 'return id(operating_mode).state == "AUTO_REMOTO";'
+                then:
+                  - script.execute:
+                      id: set_level
+                      lvl: 0
+                  - lambda: |-
+                      id(motion_state) = 0;
+                      id(last_auto_ms) = 0;
+                      ESP_LOGW("HOME", "Cerrado alcanzado en AUTO_REMOTO -> espero MQTT");
+                else:
+                  - lambda: |-
+                      const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                      id(motion_state) = 2; // RESTORING
+                      id(motion_state_since_ms) = now;
+                      ESP_LOGW("HOME", "Cerrado alcanzado -> restauro nivel=%d", id(boot_restore_level));
+                  - script.execute:
+                      id: set_level
+                      lvl: !lambda 'return id(boot_restore_level);'
           else:
             - script.execute:
                 id: set_level
@@ -251,10 +465,11 @@ script:
 
 # -------------------- Binary sensors --------------------
 binary_sensor:
-  - platform: wireguard
-    status:
-      id: wg_online
-      name: "WireGuard Online"
+  - platform: template
+    id: remote_discharge_status
+    name: "Descarga remota habilitada"
+    lambda: |-
+      return id(remote_discharge_enabled);
 
   - platform: gpio
     id: endstop_closed
@@ -313,11 +528,19 @@ display:
       }
 
       if (id(temp_used_internal).has_state()) {
-        it.printf(0, 18, id(font_small), "Nucleo: %.1f°C", id(temp_used_internal).state);
+        it.printf(0, 18, id(font_small), "Ladrillos: %.1f°C", id(temp_used_internal).state);
       } else {
-        it.printf(0, 18, id(font_small), "Nucleo: --");
+        it.printf(0, 18, id(font_small), "Ladrillos: --");
       }
-      it.printf(0, 30, id(font_small), "Objetivo: %.1f°C", id(temp_target).state);
+      if (id(operating_mode).state == "AUTO_REMOTO") {
+        if (id(remote_setpoint_valid)) {
+          it.printf(0, 30, id(font_small), "Objetivo: %.1f°C", id(remote_temp_target));
+        } else {
+          it.printf(0, 30, id(font_small), "Objetivo: --");
+        }
+      } else {
+        it.printf(0, 30, id(font_small), "Objetivo: %.1f°C", id(temp_target).state);
+      }
 
       // --- 2. ICONO TRAMPILLA (Derecha) ---
       it.rectangle(95, 0, 30, 45);
@@ -333,10 +556,12 @@ display:
 
       // --- 3. BARRA DE ESTADO ---
       it.line(0, 50, 127, 50);
-      const char* auto_txt = id(auto_mode) ? "AUTO" : "MAN ";
+      const char* mode_txt = "MAN";
+      if (id(operating_mode).state == "AUTO_LOCAL") mode_txt = "AL ";
+      if (id(operating_mode).state == "AUTO_REMOTO") mode_txt = "AR ";
       const char* dbg_txt  = id(debug_mode) ? "DEBUG" : "REAL";
-      it.printf(0, 52, id(font_small), "%s | %s | WG:%s",
-                auto_txt, dbg_txt, id(wg_online).state ? "ON" : "OFF");
+      it.printf(0, 52, id(font_small), "%s | %s | MQ:%s",
+                mode_txt, dbg_txt, id(mqtt_client)->is_connected() ? "ON" : "OFF");
 
 # -------------------- Sensores temperatura --------------------
 one_wire:
@@ -360,6 +585,7 @@ sensor:
             if (!id(debug_mode)) {
               id(temp_used_internal).publish_state(x);
             }
+        - script.execute: update_stored_soc
 
   - platform: dht
     pin: GPIO10
@@ -390,12 +616,12 @@ sensor:
     update_interval: 10s
 
   - platform: template
-    name: "Temperatura exterior usada"
+    name: "Temperatura ambiente usada"
     id: temp_used_external
     accuracy_decimals: 1
 
   - platform: template
-    name: "Temperatura interior usada"
+    name: "Temperatura ladrillos usada"
     id: temp_used_internal
     accuracy_decimals: 1
 
@@ -405,10 +631,30 @@ sensor:
     accuracy_decimals: 0
 
   - platform: template
-    name: "% Apertura (reportado)"
+    name: "% Apertura (real)"
     id: open_percent
     unit_of_measurement: "%"
     accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      const int steps5 = atoi("${steps_level_5}");
+      if (steps5 <= 0) return 0.0f;
+
+      float pct = ((float) id(motor).current_position * 100.0f) / steps5;
+      if (pct < 0.0f) pct = 0.0f;
+      if (pct > 100.0f) pct = 100.0f;
+      return lroundf(pct);
+
+  - platform: template
+    name: "Carga acumulador (%)"
+    id: stored_soc_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "Temperatura objetivo remota"
+    id: remote_temp_target_sensor
+    accuracy_decimals: 1
 
 # -------------------- Stepper NEMA17 + TMC2209 (STEP/DIR) --------------------
 stepper:
@@ -431,23 +677,6 @@ stepper:
 # -------------------- Controles HA --------------------
 switch:
   - platform: template
-    name: "Modo Automático"
-    icon: "mdi:autorenew"
-    restore_mode: RESTORE_DEFAULT_ON
-    lambda: |-
-      return id(auto_mode);
-    turn_on_action:
-      - lambda: |-
-          id(auto_mode) = true;
-          id(last_auto_ms) = 0;
-          ESP_LOGW("CTRL", "AUTO ON");
-    turn_off_action:
-      - lambda: |-
-          id(auto_mode) = false;
-          id(last_auto_ms) = 0;
-          ESP_LOGW("CTRL", "AUTO OFF");
-
-  - platform: template
     name: "Debug (usar Fake Temp)"
     id: debug_switch
     lambda: |-
@@ -465,12 +694,34 @@ switch:
           if (id(temp_ladrillos).has_state()) id(temp_used_internal).publish_state(id(temp_ladrillos).state);
           ESP_LOGW("CTRL", "DEBUG OFF");
 
+select:
+  - platform: template
+    name: "Modo de funcionamiento"
+    id: operating_mode
+    icon: "mdi:thermostat-auto"
+    optimistic: true
+    restore_value: true
+    initial_option: "AUTO_LOCAL"
+    options:
+      - "MANUAL"
+      - "AUTO_LOCAL"
+      - "AUTO_REMOTO"
+    set_action:
+      - lambda: |-
+          id(last_auto_ms) = 0;
+          id(last_telemetry_ms) = 0;
+          ESP_LOGW("CTRL", "Modo=%s", x.c_str());
+
+          if (x == "AUTO_REMOTO") {
+            id(force_remote_close)->execute();
+          }
+
 number:
   - platform: template
     name: "Temperatura objetivo"
     id: temp_target
-    min_value: 18
-    max_value: 25
+    min_value: ${temp_target_min}
+    max_value: ${temp_target_max}
     step: 0.1
     restore_value: true
     initial_value: ${temp_target_default}
@@ -506,6 +757,32 @@ number:
           if (id(debug_mode)) id(temp_used_internal).publish_state(x);
 
   - platform: template
+    name: "Temperatura ladrillos al 0% de carga"
+    id: brick_temp_soc_min
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 300
+    step: 1
+    restore_value: true
+    initial_value: ${brick_temp_soc_min_default}
+    optimistic: true
+    set_action:
+      - script.execute: update_stored_soc
+
+  - platform: template
+    name: "Temperatura ladrillos al 100% de carga"
+    id: brick_temp_soc_max
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 300
+    step: 1
+    restore_value: true
+    initial_value: ${brick_temp_soc_max_default}
+    optimistic: true
+    set_action:
+      - script.execute: update_stored_soc
+
+  - platform: template
     name: "Nivel Descarga (manual)"
     id: level_manual
     min_value: 0
@@ -525,8 +802,8 @@ number:
               return;
             }
 
-            if (id(auto_mode)) {
-              ESP_LOGW("MANUAL", "Ignorado: AUTO=ON (pedido=%d)", lvl);
+            if (id(operating_mode).state != "MANUAL") {
+              ESP_LOGW("MANUAL", "Ignorado: modo=%s (pedido=%d)", id(operating_mode).state.c_str(), lvl);
               id(level_manual).publish_state(id(saved_level));
               return;
             }
@@ -547,6 +824,20 @@ number:
       - lambda: |-
           id(last_auto_ms) = 0;
 
+  - platform: template
+    name: "Periodo telemetría MQTT"
+    id: mqtt_telemetry_period_in_seconds
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 600
+    step: 5
+    restore_value: true
+    initial_value: 30
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(last_telemetry_ms) = 0;
+
 button:
   - platform: template
     name: "Marcar posición actual como Nivel 0"
@@ -555,9 +846,9 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return id(motion_state) != 0;'
+              lambda: 'return id(motion_state) != 0 || id(operating_mode).state != "MANUAL";'
             then:
-              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");'
+              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
               - script.execute:
                   id: anchor_steps
@@ -573,9 +864,9 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return id(motion_state) != 0;'
+              lambda: 'return id(motion_state) != 0 || id(operating_mode).state != "MANUAL";'
             then:
-              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");'
+              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
               - script.execute:
                   id: set_level
@@ -588,9 +879,9 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return id(motion_state) != 0;'
+              lambda: 'return id(motion_state) != 0 || id(operating_mode).state != "MANUAL";'
             then:
-              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");'
+              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
               - script.execute:
                   id: set_level
@@ -643,12 +934,20 @@ interval:
             id(last_auto_ms) = now;
           }
 
-  # Control automático 0..5
+  # Control automático 0..5, local o remoto
   - interval: 1s
     then:
       - lambda: |-
           if (id(motion_state) != 0) return;
-          if (!id(auto_mode)) return;
+
+          const bool auto_local = id(operating_mode).state == "AUTO_LOCAL";
+          const bool auto_remote = id(operating_mode).state == "AUTO_REMOTO";
+          if (!auto_local && !auto_remote) return;
+
+          if (auto_remote && (!id(remote_discharge_enabled) || !id(remote_setpoint_valid))) {
+            id(force_remote_close)->execute();
+            return;
+          }
 
           const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
           const uint32_t period_ms = (uint32_t) lroundf(id(auto_period_in_seconds).state * 1000.0f);
@@ -665,7 +964,7 @@ interval:
           }
 
           const float T = id(temp_used_external).state;
-          const float target = id(temp_target).state;
+          const float target = auto_remote ? id(remote_temp_target) : id(temp_target).state;
           const float H  = atof("${hysteresis}");
           const float band = atof("${step_band}");
 
@@ -686,8 +985,25 @@ interval:
             return;
           }
 
-          ESP_LOGI("CTRL", "T=%.2f Obj=%.2f -> nivel_obj=%d (periodo=%us)",
+          ESP_LOGI("CTRL", "Modo=%s T=%.2f Obj=%.2f -> nivel_obj=%d (periodo=%us)",
+                   auto_remote ? "AUTO_REMOTO" : "AUTO_LOCAL",
                    T, target, target_level, (unsigned) lroundf(id(auto_period_in_seconds).state));
 
           id(set_level)->execute(target_level);
 
+  # Telemetría periódica en AUTO_REMOTO
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(operating_mode).state != "AUTO_REMOTO") return;
+
+          const float configured_period = id(mqtt_telemetry_period_in_seconds).state;
+          if (isnan(configured_period) || configured_period <= 0.0f) return;
+
+          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+          const uint32_t period_ms = (uint32_t) lroundf(configured_period * 1000.0f);
+
+          if (id(last_telemetry_ms) != 0 && now - id(last_telemetry_ms) < period_ms) return;
+
+          id(last_telemetry_ms) = now;
+          id(publish_remote_telemetry)->execute();
