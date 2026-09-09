@@ -1,0 +1,693 @@
+substitutions:
+  name: "heater"
+  friendly_name: "Heater Test"
+  lan_private_ip: "192.168.11.201"
+  wg_private_ip: "10.8.0.23"
+
+  # ---- Calibración mecánica ----
+  steps_level_5: "2500"   # pasos desde nivel 0 (cerrado) a nivel 5 (abierto)
+
+  # ---- Control térmico ----
+  temp_target_default: "21.0"
+  hysteresis: "0.4"       # °C (banda muerta)
+  step_band: "0.4"        # °C por nivel (agresividad)
+
+  # ---- Endstops / Homing ----
+  endstop_debounce: "30ms"
+  homing_extra_steps: "600"     # “pasos de más” para asegurar tocar el endstop
+  motion_timeout_s: "30"        # timeout seguridad para HOMING/RESTORE
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          // Clamp del último nivel persistido
+          int lvl = id(saved_level);
+          if (lvl < 0) lvl = 0;
+          if (lvl > 5) lvl = 5;
+          id(saved_level) = lvl;
+
+          // Nivel a restaurar tras homing (en boot o recalibración)
+          id(boot_restore_level) = lvl;
+
+          ESP_LOGW("BOOT", "Boot: homing a cerrado y luego restauro nivel=%d", lvl);
+
+          // Bloquea auto/manual hasta terminar secuencia
+          id(motion_state) = 1;  // 0=READY, 1=HOMING, 2=RESTORING
+          id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
+
+      - delay: 500ms
+      - script.execute: home_to_closed
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  logs:
+    wireguard: WARN
+
+api:
+  encryption:
+    key: "nebZQ3yZMkrBeLhlfmLasjdjrBM8atyVm6NdVAyPW8M="
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Madrid
+
+wifi:
+  use_address: ${wg_private_ip}
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ${friendly_name}
+    password: !secret wifi_ap_password
+#  manual_ip:
+#    static_ip: ${lan_private_ip}
+#    gateway: 192.168.1.1
+#    subnet: 255.255.255.0
+
+captive_portal:
+
+wireguard:
+  address: ${wg_private_ip}
+  private_key: !secret wg_private_key_heater
+  peer_endpoint: !secret wg_peer_endpoint
+  peer_port: !secret wg_peer_port
+  peer_public_key: !secret wg_peer_public_key
+  peer_preshared_key: !secret wg_preshared_key_heater
+  peer_allowed_ips:
+    - 10.8.0.0/24
+  peer_persistent_keepalive: !secret wg_peer_persistent_keepalive
+  netmask: 255.255.255.0
+
+globals:
+  # Modos
+  - id: auto_mode
+    type: bool
+    restore_value: true
+    initial_value: "true"
+
+  - id: debug_mode
+    type: bool
+    restore_value: true
+    initial_value: "false"
+
+  # Control AUTO (gating por periodo)
+  - id: last_auto_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  # Persistencia de nivel (último nivel comandado)
+  - id: saved_level
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+  # Nivel que se restaura tras homing (boot/recalibración)
+  - id: boot_restore_level
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+  # Estado de movimiento:
+  # 0=READY (normal), 1=HOMING (buscando cerrado), 2=RESTORING (volviendo al nivel)
+  - id: motion_state
+    type: int
+    restore_value: false
+    initial_value: "1"
+
+  - id: motion_state_since_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+# -------------------- Scripts (núcleo de control) --------------------
+script:
+  # Mueve a un nivel (0..5) + publica estado + persiste saved_level
+  - id: set_level
+    mode: restart
+    parameters:
+      lvl: int
+    then:
+      - lambda: |-
+          int level = lvl;
+          if (level < 0) level = 0;
+          if (level > 5) level = 5;
+
+          const int steps5 = atoi("${steps_level_5}");
+          const int target_steps = (int) lroundf(level * (steps5 / 5.0f));
+
+          ESP_LOGI("POS", "set_level(%d) -> target_steps=%d", level, target_steps);
+
+          id(motor).set_target(target_steps);
+
+          id(saved_level) = level;
+          id(level_reported).publish_state(level);
+          id(open_percent).publish_state((level * 100) / 5);
+          id(level_manual).publish_state(level);
+
+  # Ancla la posición interna del stepper (report_position + set_target) para evitar movimientos raros
+  - id: anchor_steps
+    mode: restart
+    parameters:
+      steps: int
+    then:
+      - lambda: |-
+          id(motor).report_position(steps);
+          id(motor).set_target(steps);
+
+  # Inicia homing hacia cerrado (nivel 0). Si ya está cerrado, dispara directamente “cerrado alcanzado”.
+  - id: home_to_closed
+    mode: restart
+    then:
+      - lambda: |-
+          id(motion_state) = 1; // HOMING
+          id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
+          ESP_LOGW("HOME", "Homing hacia cerrado...");
+
+      - if:
+          condition:
+            binary_sensor.is_on: endstop_closed
+          then:
+            - script.execute: on_closed_endstop
+          else:
+            - stepper.set_target:
+                id: motor
+                target: !lambda |-
+                  const int steps5 = atoi("${steps_level_5}");
+                  const int extra = atoi("${homing_extra_steps}");
+                  return -(steps5 + extra);
+
+  # Handler del endstop cerrado:
+  # - si estamos HOMING: ancla a 0 y RESTORE a boot_restore_level
+  # - si estamos en normal: ancla a 0 y fija nivel 0 (sin “restore”)
+  - id: on_closed_endstop
+    mode: restart
+    then:
+      - lambda: |-
+          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+
+          // Ancla físico -> pasos 0
+          ESP_LOGW("ENDSTOP", "CERRADO activado (motion_state=%d) -> anchor a 0", id(motion_state));
+          id(last_auto_ms) = now; // evita auto inmediato cuando se libere
+
+      - script.execute:
+          id: anchor_steps
+          steps: 0
+
+      - if:
+          condition:
+            lambda: 'return id(motion_state) == 1;'
+          then:
+            - lambda: |-
+                const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                id(motion_state) = 2; // RESTORING
+                id(motion_state_since_ms) = now;
+                ESP_LOGW("HOME", "Cerrado alcanzado -> restauro nivel=%d", id(boot_restore_level));
+            - script.execute:
+                id: set_level
+                lvl: !lambda 'return id(boot_restore_level);'
+          else:
+            - script.execute:
+                id: set_level
+                lvl: 0
+
+  # Handler del endstop abierto: ancla a steps5 y fija nivel 5 (siempre seguro)
+  - id: on_open_endstop
+    mode: restart
+    then:
+      - lambda: |-
+          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+          id(last_auto_ms) = now;
+          ESP_LOGW("ENDSTOP", "ABIERTO activado (motion_state=%d) -> anchor a 5", id(motion_state));
+
+      - script.execute:
+          id: anchor_steps
+          steps: !lambda 'return atoi("${steps_level_5}");'
+
+      - script.execute:
+          id: set_level
+          lvl: 5
+
+      # Si estábamos en HOMING/RESTORING, al tocar abierto ya estamos en estado conocido; liberamos.
+      - lambda: |-
+          if (id(motion_state) != 0) {
+            id(motion_state) = 0;
+            ESP_LOGW("BOOT", "Fin por endstop abierto -> READY");
+          }
+
+# -------------------- Binary sensors --------------------
+binary_sensor:
+  - platform: wireguard
+    status:
+      id: wg_online
+      name: "WireGuard Online"
+
+  - platform: gpio
+    id: endstop_closed
+    name: "Endstop Cerrado"
+    pin:
+      number: GPIO2
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: ${endstop_debounce}
+    on_press:
+      then:
+        - script.execute: on_closed_endstop
+
+  - platform: gpio
+    id: endstop_open
+    name: "Endstop Abierto"
+    pin:
+      number: GPIO3
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on_off: ${endstop_debounce}
+    on_press:
+      then:
+        - script.execute: on_open_endstop
+
+# -------------------- Display SH1106 --------------------
+i2c:
+  sda: GPIO6
+  scl: GPIO7
+  scan: true
+
+font:
+  - file: "gfonts://Roboto"
+    id: font_small
+    size: 12
+  - file: "gfonts://Roboto"
+    id: font_big
+    size: 18
+
+display:
+  - platform: ssd1306_i2c
+    model: "SH1106 128x64"
+    address: 0x3C
+    rotation: 0
+    update_interval: 3s
+    lambda: |-
+      // --- 1. TEMPERATURAS (Lado Izquierdo) ---
+      if (id(temp_used_external).has_state()) {
+        it.printf(0, 0, id(font_big), "%.1f°C", id(temp_used_external).state);
+      }
+
+      if (id(temp_used_internal).has_state()) {
+        it.printf(0, 18, id(font_small), "Nucleo: %.1f°C", id(temp_used_internal).state);
+      } else {
+        it.printf(0, 18, id(font_small), "Nucleo: --");
+      }
+      it.printf(0, 30, id(font_small), "Objetivo: %.1f°C", id(temp_target).state);
+
+      // --- 2. ICONO TRAMPILLA (Derecha) ---
+      it.rectangle(95, 0, 30, 45);
+
+      float pct = id(open_percent).has_state() ? id(open_percent).state : 0.0f;
+      if (pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      int gap = (int)((pct / 100.0f) * 36);
+
+      it.line(97, 40 - gap, 123, 40 - gap);
+      it.line(97, 41 - gap, 123, 41 - gap);
+      it.printf(95, 15, id(font_small), "%3.0f%%", pct);
+
+      // --- 3. BARRA DE ESTADO ---
+      it.line(0, 50, 127, 50);
+      const char* auto_txt = id(auto_mode) ? "AUTO" : "MAN ";
+      const char* dbg_txt  = id(debug_mode) ? "DEBUG" : "REAL";
+      it.printf(0, 52, id(font_small), "%s | %s | WG:%s",
+                auto_txt, dbg_txt, id(wg_online).state ? "ON" : "OFF");
+
+# -------------------- Sensores temperatura --------------------
+one_wire:
+  - platform: gpio
+    pin: GPIO22
+
+sensor:
+  - platform: dallas_temp
+    name: "Temperatura Ladrillos (real)"
+    id: temp_ladrillos
+    accuracy_decimals: 1
+    update_interval: 10s
+    filters:
+      - offset: 0.2
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+    on_value:
+      then:
+        - lambda: |-
+            if (!id(debug_mode)) {
+              id(temp_used_internal).publish_state(x);
+            }
+
+  - platform: dht
+    pin: GPIO10
+    model: DHT22
+    temperature:
+      id: temp_room
+      name: "Temperatura Habitación (real)"
+      accuracy_decimals: 1
+      filters:
+        - offset: -1
+        - sliding_window_moving_average:
+            window_size: 6
+            send_every: 1
+      on_value:
+        then:
+          - lambda: |-
+              if (!id(debug_mode)) {
+                id(temp_used_external).publish_state(x);
+              }
+    humidity:
+      id: humidity_room
+      name: "Humedad Habitación (real)"
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: 6
+            send_every: 1
+    update_interval: 10s
+
+  - platform: template
+    name: "Temperatura exterior usada"
+    id: temp_used_external
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Temperatura interior usada"
+    id: temp_used_internal
+    accuracy_decimals: 1
+
+  - platform: template
+    name: "Nivel Descarga (reportado)"
+    id: level_reported
+    accuracy_decimals: 0
+
+  - platform: template
+    name: "% Apertura (reportado)"
+    id: open_percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+
+# -------------------- Stepper NEMA17 + TMC2209 (STEP/DIR) --------------------
+stepper:
+  - platform: a4988
+    id: motor
+    step_pin: GPIO19
+    dir_pin: GPIO20
+
+    # En TMC2209 el pin es EN (ENABLE) en lugar de SLEEP.
+    # ESPHome usa "sleep_pin" para dormir al terminar; en TMC hay que INVERTIRLO.
+    # Con esto replicas tu "sleep_when_done: true" (se deshabilita al llegar al target).
+    sleep_pin:
+      number: GPIO18
+      inverted: true
+
+    max_speed: 250 steps/s
+    acceleration: 600 steps/s^2
+    deceleration: 600 steps/s^2
+
+# -------------------- Controles HA --------------------
+switch:
+  - platform: template
+    name: "Modo Automático"
+    icon: "mdi:autorenew"
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: |-
+      return id(auto_mode);
+    turn_on_action:
+      - lambda: |-
+          id(auto_mode) = true;
+          id(last_auto_ms) = 0;
+          ESP_LOGW("CTRL", "AUTO ON");
+    turn_off_action:
+      - lambda: |-
+          id(auto_mode) = false;
+          id(last_auto_ms) = 0;
+          ESP_LOGW("CTRL", "AUTO OFF");
+
+  - platform: template
+    name: "Debug (usar Fake Temp)"
+    id: debug_switch
+    lambda: |-
+      return id(debug_mode);
+    turn_on_action:
+      - lambda: |-
+          id(debug_mode) = true;
+          id(temp_used_external).publish_state(id(fake_external_temp).state);
+          id(temp_used_internal).publish_state(id(fake_internal_temp).state);
+          ESP_LOGW("CTRL", "DEBUG ON");
+    turn_off_action:
+      - lambda: |-
+          id(debug_mode) = false;
+          if (id(temp_room).has_state()) id(temp_used_external).publish_state(id(temp_room).state);
+          if (id(temp_ladrillos).has_state()) id(temp_used_internal).publish_state(id(temp_ladrillos).state);
+          ESP_LOGW("CTRL", "DEBUG OFF");
+
+number:
+  - platform: template
+    name: "Temperatura objetivo"
+    id: temp_target
+    min_value: 18
+    max_value: 25
+    step: 0.1
+    restore_value: true
+    initial_value: ${temp_target_default}
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(last_auto_ms) = 0;
+
+  - platform: template
+    name: "Fake Room Temp"
+    id: fake_external_temp
+    min_value: 10
+    max_value: 35
+    step: 0.5
+    restore_value: true
+    initial_value: 21.0
+    optimistic: true
+    set_action:
+      - lambda: |-
+          if (id(debug_mode)) id(temp_used_external).publish_state(x);
+
+  - platform: template
+    name: "Fake Ladrillos Temp"
+    id: fake_internal_temp
+    min_value: 20
+    max_value: 200
+    step: 1
+    restore_value: true
+    initial_value: 30.0
+    optimistic: true
+    set_action:
+      - lambda: |-
+          if (id(debug_mode)) id(temp_used_internal).publish_state(x);
+
+  - platform: template
+    name: "Nivel Descarga (manual)"
+    id: level_manual
+    min_value: 0
+    max_value: 5
+    step: 1
+    optimistic: true
+    set_action:
+      then:
+        - lambda: |-
+            int lvl = (int) lroundf(x);
+            if (lvl < 0) lvl = 0;
+            if (lvl > 5) lvl = 5;
+
+            if (id(motion_state) != 0) {
+              ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");
+              id(level_manual).publish_state(id(saved_level));
+              return;
+            }
+
+            if (id(auto_mode)) {
+              ESP_LOGW("MANUAL", "Ignorado: AUTO=ON (pedido=%d)", lvl);
+              id(level_manual).publish_state(id(saved_level));
+              return;
+            }
+
+            id(set_level)->execute(lvl);
+
+  - platform: template
+    name: "Periodo control automático"
+    id: auto_period_in_seconds
+    unit_of_measurement: "s"
+    min_value: 10
+    max_value: 300
+    step: 5
+    restore_value: true
+    initial_value: 30
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(last_auto_ms) = 0;
+
+button:
+  - platform: template
+    name: "Marcar posición actual como Nivel 0"
+    icon: "mdi:target"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(motion_state) != 0;'
+            then:
+              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");'
+            else:
+              - script.execute:
+                  id: anchor_steps
+                  steps: 0
+              - script.execute:
+                  id: set_level
+                  lvl: 0
+
+  - platform: template
+    name: "Ir a Nivel 0 (cerrado)"
+    icon: "mdi:arrow-collapse"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(motion_state) != 0;'
+            then:
+              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");'
+            else:
+              - script.execute:
+                  id: set_level
+                  lvl: 0
+
+  - platform: template
+    name: "Ir a Nivel 5 (máximo)"
+    icon: "mdi:arrow-expand"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(motion_state) != 0;'
+            then:
+              - lambda: 'ESP_LOGW("MANUAL", "Ignorado: homing/restauración en curso");'
+            else:
+              - script.execute:
+                  id: set_level
+                  lvl: 5
+
+  - platform: template
+    name: "Recalibrar (Homing a Cerrado)"
+    icon: "mdi:home-import-outline"
+    on_press:
+      then:
+        - lambda: |-
+            int lvl = id(saved_level);
+            if (lvl < 0) lvl = 0;
+            if (lvl > 5) lvl = 5;
+            id(boot_restore_level) = lvl;
+
+            id(motion_state) = 1;
+            id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
+
+            ESP_LOGW("HOME", "Recalibrar: homing a cerrado y restauro nivel=%d", lvl);
+        - script.execute: home_to_closed
+
+# -------------------- Supervisión de homing/restore + AUTO control --------------------
+interval:
+  # Watchdog de movimiento: libera lock cuando termina restore (o por timeout)
+  - interval: 250ms
+    then:
+      - lambda: |-
+          if (id(motion_state) == 0) return;
+
+          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+          const uint32_t elapsed = now - id(motion_state_since_ms);
+          const uint32_t timeout_ms = (uint32_t)(atoi("${motion_timeout_s}") * 1000UL);
+
+          // Si estamos RESTORING y llegamos al target, liberamos.
+          if (id(motion_state) == 2) {
+            if (id(motor).current_position == id(motor).target_position) {
+              id(motion_state) = 0;
+              id(last_auto_ms) = now;
+              ESP_LOGW("BOOT", "Restore completado -> READY (lvl=%d)", id(saved_level));
+              return;
+            }
+          }
+
+          // Timeout seguridad (para HOMING o RESTORING)
+          if (elapsed > timeout_ms) {
+            ESP_LOGE("BOOT", "Timeout motion_state=%d (%ums). Paro motor y desbloqueo.", id(motion_state), (unsigned)elapsed);
+            id(motor).set_target(id(motor).current_position);  // stop suave
+            id(motion_state) = 0;
+            id(last_auto_ms) = now;
+          }
+
+  # Control automático 0..5
+  - interval: 1s
+    then:
+      - lambda: |-
+          if (id(motion_state) != 0) return;
+          if (!id(auto_mode)) return;
+
+          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+          const uint32_t period_ms = (uint32_t) lroundf(id(auto_period_in_seconds).state * 1000.0f);
+
+          if (id(last_auto_ms) != 0) {
+            const uint32_t elapsed = now - id(last_auto_ms);
+            if (elapsed < period_ms) return;
+          }
+          id(last_auto_ms) = now;
+
+          if (!id(temp_used_external).has_state()) {
+            ESP_LOGW("CTRL", "temp_used_external sin estado aun");
+            return;
+          }
+
+          const float T = id(temp_used_external).state;
+          const float target = id(temp_target).state;
+          const float H  = atof("${hysteresis}");
+          const float band = atof("${step_band}");
+
+          int target_level;
+          if (T >= target + H) target_level = 0;
+          else if (T <= target - H) target_level = 5;
+          else {
+            float delta = target - T;
+            int lvl = 2 + (int) lroundf(delta / band);
+            if (lvl < 0) lvl = 0;
+            if (lvl > 5) lvl = 5;
+            target_level = lvl;
+          }
+
+          // Anti-oscilación simple: si ya estamos en ese nivel, no hacemos nada
+          if (id(saved_level) == target_level) {
+            ESP_LOGD("CTRL", "No muevo: ya estoy en nivel=%d", target_level);
+            return;
+          }
+
+          ESP_LOGI("CTRL", "T=%.2f Obj=%.2f -> nivel_obj=%d (periodo=%us)",
+                   T, target, target_level, (unsigned) lroundf(id(auto_period_in_seconds).state));
+
+          id(set_level)->execute(target_level);
+
