@@ -15,9 +15,9 @@ substitutions:
   step_band: "0.4"        # °C por nivel (agresividad)
 
   # ---- MQTT ----
-  mqtt_setpoint_topic: "ha/${name}/setpoint"
-  mqtt_discharge_topic: "ha/${name}/discharge"
-  mqtt_telemetry_topic: "ha/${name}/telemetry"
+  mqtt_setpoint_topic: "telemetria/acumuladores/${name}/setpoint"
+  mqtt_discharge_topic: "telemetria/acumuladores/${name}/discharge"
+  mqtt_telemetry_topic: "telemetria/acumuladores/${name}/telemetry"
 
   # ---- Estado de carga térmica ----
   brick_temp_soc_min_default: "20.0"   # 0 % de carga
@@ -508,29 +508,51 @@ script:
                 id: set_level
                 lvl: 0
 
-  # Handler del endstop abierto: ancla a steps5 y fija nivel 5 (siempre seguro)
+  # Handler del endstop abierto:
+  # - durante HOMING hacia cerrado: es el endstop contrario, por lo que para y marca FAULT
+  # - durante RESTORING/READY: ancla a steps5 y fija nivel 5
   - id: on_open_endstop
     mode: restart
     then:
-      - lambda: |-
-          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-          id(last_auto_ms) = now;
-          ESP_LOGW("ENDSTOP", "ABIERTO activado (motion_state=%d) -> anchor a 5", id(motion_state));
+      - if:
+          condition:
+            lambda: 'return id(motion_state) == 1;'
+          then:
+            - lambda: |-
+                const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                id(motor).set_target(id(motor).current_position);
+                id(motion_fault) = true;
+                id(motion_state) = 3;
+                id(motion_state_since_ms) = now;
+                id(last_auto_ms) = now;
+                ESP_LOGE("ENDSTOP", "ABIERTO activado durante HOMING a cerrado -> FAULT");
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(motion_fault) || id(motion_state) == 3;'
+                then:
+                  - lambda: |-
+                      id(motor).set_target(id(motor).current_position);
+                      ESP_LOGW("ENDSTOP", "ABIERTO ignorado: movimiento en FAULT");
+                else:
+                  - lambda: |-
+                      const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                      id(last_auto_ms) = now;
+                      ESP_LOGW("ENDSTOP", "ABIERTO activado (motion_state=%d) -> anchor a 5", id(motion_state));
 
-      - script.execute:
-          id: anchor_steps
-          steps: !lambda 'return atoi("${steps_level_5}");'
+                  - script.execute:
+                      id: anchor_steps
+                      steps: !lambda 'return atoi("${steps_level_5}");'
 
-      - script.execute:
-          id: set_level
-          lvl: 5
+                  - script.execute:
+                      id: set_level
+                      lvl: 5
 
-      # Si estábamos en HOMING/RESTORING, al tocar abierto ya estamos en estado conocido; liberamos.
-      - lambda: |-
-          if (id(motion_state) != 0 && !id(motion_fault)) {
-            id(motion_state) = 0;
-            ESP_LOGW("BOOT", "Fin por endstop abierto -> READY");
-          }
+                  - lambda: |-
+                      if (id(motion_state) == 2) {
+                        id(motion_state) = 0;
+                        ESP_LOGW("BOOT", "Restore completado por endstop abierto -> READY");
+                      }
 
 # -------------------- Binary sensors --------------------
 binary_sensor:
