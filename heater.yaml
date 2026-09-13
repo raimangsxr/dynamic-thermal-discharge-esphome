@@ -1,7 +1,7 @@
 substitutions:
-  name: "heater-salon"
-  friendly_name: "Acumulador Salón Test"
-  lan_private_ip: "192.168.11.101"
+  name: "heater-entrada"
+  friendly_name: "Acumulador Entrada Test"
+  lan_private_ip: "192.168.11.102"
   #wg_private_ip: "10.8.0.23"
 
   # ---- Calibración mecánica ----
@@ -95,10 +95,10 @@ wifi:
   ap:
     ssid: ${friendly_name}
     password: !secret wifi_ap_password
-#  manual_ip:
-#    static_ip: ${lan_private_ip}
-#    gateway: 192.168.11.1
-#    subnet: 255.255.255.0
+  manual_ip:
+    static_ip: ${lan_private_ip}
+    gateway: 192.168.11.1
+    subnet: 255.255.255.0
 
 captive_portal:
 
