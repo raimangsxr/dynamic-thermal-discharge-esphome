@@ -63,6 +63,7 @@ esphome:
           id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
 
       - delay: 500ms
+      - script.execute: update_stored_soc
       - script.execute: home_to_closed
 
 esp32:
@@ -229,23 +230,13 @@ globals:
     restore_value: false
     initial_value: "0"
 
-  # Marcas de frescura de las temperaturas reales y de las señales usadas.
+  # Marcas de frescura de las temperaturas usadas.
   - id: last_temp_external_valid_ms
     type: uint32_t
     restore_value: false
     initial_value: "0"
 
   - id: last_temp_internal_valid_ms
-    type: uint32_t
-    restore_value: false
-    initial_value: "0"
-
-  - id: last_temp_room_valid_ms
-    type: uint32_t
-    restore_value: false
-    initial_value: "0"
-
-  - id: last_temp_ladrillos_valid_ms
     type: uint32_t
     restore_value: false
     initial_value: "0"
@@ -350,13 +341,14 @@ script:
             id(set_level)->execute(0);
           }
 
-  # Calcula el estado de carga térmica a partir de la temperatura real de los
-  # ladrillos y de los dos límites configurables en Home Assistant.
+  # Calcula el estado de carga térmica a partir de la temperatura de ladrillos
+  # usada (real en modo normal o fake en DEBUG) y de los dos límites
+  # configurables en Home Assistant.
   - id: update_stored_soc
     mode: restart
     then:
       - lambda: |-
-          if (!id(temp_ladrillos).has_state() || isnan(id(temp_ladrillos).state)) {
+          if (!id(temp_used_internal).has_state() || isnan(id(temp_used_internal).state)) {
             return;
           }
 
@@ -369,13 +361,13 @@ script:
             return;
           }
 
-          float soc = ((id(temp_ladrillos).state - temp_min) / (temp_max - temp_min)) * 100.0f;
+          float soc = ((id(temp_used_internal).state - temp_min) / (temp_max - temp_min)) * 100.0f;
           if (soc < 0.0f) soc = 0.0f;
           if (soc > 100.0f) soc = 100.0f;
 
           id(stored_soc_percent).publish_state(lroundf(soc));
 
-  # Publica la telemetría remota con valores físicos actuales.
+  # Publica la telemetría remota con los valores de temperatura usados.
   - id: publish_remote_telemetry
     mode: restart
     then:
@@ -393,13 +385,13 @@ script:
                           const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
                           const uint32_t timeout_ms =
                               (uint32_t)(atoi("${sensor_stale_timeout_s}") * 1000UL);
-                          return id(temp_room).has_state() && !isnan(id(temp_room).state) &&
-                                 id(last_temp_room_valid_ms) != 0 &&
-                                 now - id(last_temp_room_valid_ms) <= timeout_ms &&
+                          return id(temp_used_external).has_state() && !isnan(id(temp_used_external).state) &&
+                                 id(last_temp_external_valid_ms) != 0 &&
+                                 now - id(last_temp_external_valid_ms) <= timeout_ms &&
                                  id(stored_soc_percent).has_state() &&
                                  !isnan(id(stored_soc_percent).state) &&
-                                 id(last_temp_ladrillos_valid_ms) != 0 &&
-                                 now - id(last_temp_ladrillos_valid_ms) <= timeout_ms;
+                                 id(last_temp_internal_valid_ms) != 0 &&
+                                 now - id(last_temp_internal_valid_ms) <= timeout_ms;
                       then:
                         - mqtt.publish_json:
                             topic: ${mqtt_telemetry_topic}
@@ -414,7 +406,7 @@ script:
                               if (damper_pct < 0.0f) damper_pct = 0.0f;
                               if (damper_pct > 100.0f) damper_pct = 100.0f;
 
-                              root["indoor_temperature_c"] = lroundf(id(temp_room).state * 10.0f) / 10.0f;
+                              root["indoor_temperature_c"] = lroundf(id(temp_used_external).state * 10.0f) / 10.0f;
                               root["stored_soc_percent"] = (int) lroundf(id(stored_soc_percent).state);
                               root["damper_position_percent"] = (int) lroundf(damper_pct);
                       else:
@@ -682,7 +674,6 @@ sensor:
         - lambda: |-
             const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
             if (isnan(x)) {
-              id(last_temp_ladrillos_valid_ms) = 0;
               if (!id(debug_mode)) {
                 id(temp_used_internal).publish_state(NAN);
                 id(last_temp_internal_valid_ms) = 0;
@@ -690,12 +681,15 @@ sensor:
               return;
             }
 
-            id(last_temp_ladrillos_valid_ms) = now;
             if (!id(debug_mode)) {
               id(temp_used_internal).publish_state(x);
               id(last_temp_internal_valid_ms) = now;
             }
-        - script.execute: update_stored_soc
+        - if:
+            condition:
+              lambda: 'return !id(debug_mode);'
+            then:
+              - script.execute: update_stored_soc
 
   - platform: dht
     pin: GPIO10
@@ -714,7 +708,6 @@ sensor:
           - lambda: |-
               const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
               if (isnan(x)) {
-                id(last_temp_room_valid_ms) = 0;
                 if (!id(debug_mode)) {
                   id(temp_used_external).publish_state(NAN);
                   id(last_temp_external_valid_ms) = 0;
@@ -722,7 +715,6 @@ sensor:
                 return;
               }
 
-              id(last_temp_room_valid_ms) = now;
               if (!id(debug_mode)) {
                 id(temp_used_external).publish_state(x);
                 id(last_temp_external_valid_ms) = now;
@@ -812,6 +804,7 @@ switch:
           id(last_temp_external_valid_ms) = now;
           id(last_temp_internal_valid_ms) = now;
           ESP_LOGW("CTRL", "DEBUG ON");
+      - script.execute: update_stored_soc
     turn_off_action:
       - lambda: |-
           id(debug_mode) = false;
@@ -831,6 +824,7 @@ switch:
             id(last_temp_internal_valid_ms) = 0;
           }
           ESP_LOGW("CTRL", "DEBUG OFF");
+      - script.execute: update_stored_soc
 
 select:
   - platform: template
@@ -902,6 +896,11 @@ number:
             id(temp_used_internal).publish_state(x);
             id(last_temp_internal_valid_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
           }
+      - if:
+          condition:
+            lambda: 'return id(debug_mode);'
+          then:
+            - script.execute: update_stored_soc
 
   - platform: template
     name: "Temperatura ladrillos al 0% de carga"
