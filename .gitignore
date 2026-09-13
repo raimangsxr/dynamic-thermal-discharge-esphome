@@ -1,1 +1,5 @@
 secrets.yaml
+.esphome/
+build/
+*.bin
+*.elf
