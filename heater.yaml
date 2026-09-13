@@ -126,9 +126,11 @@ mqtt:
   reboot_timeout: 0s
   on_connect:
     - lambda: |-
-        id(last_telemetry_ms) = 0;
+        // La conexión genera un snapshot inmediato. Marcarlo aquí evita que
+        // el intervalo de 1 s publique un duplicado en el siguiente tick.
+        id(last_telemetry_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
         ESP_LOGI("MQTT", "Conectado al broker");
-    - script.execute: publish_remote_telemetry
+    - script.execute: publish_telemetry_snapshot
   on_disconnect:
     - lambda: |-
         id(remote_discharge_enabled) = false;
@@ -237,6 +239,11 @@ globals:
     initial_value: "0"
 
   - id: last_temp_internal_valid_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+  - id: last_humidity_valid_ms
     type: uint32_t
     restore_value: false
     initial_value: "0"
@@ -367,8 +374,9 @@ script:
 
           id(stored_soc_percent).publish_state(lroundf(soc));
 
-  # Publica la telemetría remota con los valores de temperatura usados.
-  - id: publish_remote_telemetry
+  # Publica un snapshot de telemetría con los valores de temperatura usados.
+  # Las temperaturas activas son las que permiten que DEBUG use las fake.
+  - id: publish_telemetry_snapshot
     mode: restart
     then:
       - if:
@@ -379,41 +387,160 @@ script:
                 condition:
                   lambda: 'return id(mqtt_client)->is_connected();'
                 then:
-                  - if:
-                      condition:
-                        lambda: |-
-                          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-                          const uint32_t timeout_ms =
-                              (uint32_t)(atoi("${sensor_stale_timeout_s}") * 1000UL);
-                          return id(temp_used_external).has_state() && !isnan(id(temp_used_external).state) &&
-                                 id(last_temp_external_valid_ms) != 0 &&
-                                 now - id(last_temp_external_valid_ms) <= timeout_ms &&
-                                 id(stored_soc_percent).has_state() &&
-                                 !isnan(id(stored_soc_percent).state) &&
-                                 id(last_temp_internal_valid_ms) != 0 &&
-                                 now - id(last_temp_internal_valid_ms) <= timeout_ms;
-                      then:
-                        - mqtt.publish_json:
-                            topic: ${mqtt_telemetry_topic}
-                            qos: 0
-                            retain: false
-                            payload: |-
-                              const int steps5 = atoi("${steps_level_5}");
-                              float damper_pct = 0.0f;
-                              if (steps5 > 0) {
-                                damper_pct = ((float) id(motor).current_position * 100.0f) / steps5;
-                              }
-                              if (damper_pct < 0.0f) damper_pct = 0.0f;
-                              if (damper_pct > 100.0f) damper_pct = 100.0f;
+                  - mqtt.publish_json:
+                      topic: ${mqtt_telemetry_topic}
+                      qos: 0
+                      retain: false
+                      payload: |-
+                        const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                        const uint32_t timeout_ms =
+                            (uint32_t)(atoi("${sensor_stale_timeout_s}") * 1000UL);
 
-                              root["indoor_temperature_c"] = lroundf(id(temp_used_external).state * 10.0f) / 10.0f;
-                              root["stored_soc_percent"] = (int) lroundf(id(stored_soc_percent).state);
-                              root["damper_position_percent"] = (int) lroundf(damper_pct);
-                      else:
-                        - logger.log:
-                            level: DEBUG
-                            tag: MQTT
-                            format: "Telemetria omitida: faltan sensores validos"
+                        // Siempre usamos las señales activas: reales en modo
+                        // normal y fake cuando DEBUG está habilitado.
+                        const bool external_has_state = id(temp_used_external).has_state();
+                        const bool external_number_valid =
+                            external_has_state && !isnan(id(temp_used_external).state);
+                        const bool external_fresh =
+                            external_number_valid &&
+                            (id(debug_mode) ||
+                             (id(last_temp_external_valid_ms) != 0 &&
+                              now - id(last_temp_external_valid_ms) <= timeout_ms));
+
+                        const bool internal_has_state = id(temp_used_internal).has_state();
+                        const bool internal_number_valid =
+                            internal_has_state && !isnan(id(temp_used_internal).state);
+                        const bool internal_fresh =
+                            internal_number_valid &&
+                            (id(debug_mode) ||
+                             (id(last_temp_internal_valid_ms) != 0 &&
+                              now - id(last_temp_internal_valid_ms) <= timeout_ms));
+
+                        const bool humidity_has_state = id(humidity_room).has_state();
+                        const bool humidity_number_valid =
+                            humidity_has_state && !isnan(id(humidity_room).state);
+                        const bool humidity_fresh =
+                            humidity_number_valid && id(last_humidity_valid_ms) != 0 &&
+                            now - id(last_humidity_valid_ms) <= timeout_ms;
+
+                        const bool soc_has_state = id(stored_soc_percent).has_state();
+                        const bool soc_number_valid =
+                            soc_has_state && !isnan(id(stored_soc_percent).state);
+                        const bool soc_valid = soc_number_valid && internal_fresh;
+
+                        const std::string mode = id(operating_mode).current_option();
+                        const bool local_target_valid = !isnan(id(temp_target).state);
+                        const bool remote_target_valid =
+                            id(remote_setpoint_valid) && !isnan(id(remote_temp_target));
+                        const bool active_target_valid =
+                            (mode == "AUTO_LOCAL" && local_target_valid) ||
+                            (mode == "AUTO_REMOTO" && remote_target_valid);
+
+                        const char* motion_state_text = "UNKNOWN";
+                        switch (id(motion_state)) {
+                          case 0: motion_state_text = "READY"; break;
+                          case 1: motion_state_text = "HOMING"; break;
+                          case 2: motion_state_text = "RESTORING"; break;
+                          case 3: motion_state_text = "FAULT"; break;
+                        }
+
+                        const char* external_status = "unknown";
+                        if (!external_has_state) external_status = "unknown";
+                        else if (!external_number_valid) external_status = "invalid";
+                        else if (!external_fresh) external_status = "stale";
+                        else external_status = "valid";
+
+                        const char* internal_status = "unknown";
+                        if (!internal_has_state) internal_status = "unknown";
+                        else if (!internal_number_valid) internal_status = "invalid";
+                        else if (!internal_fresh) internal_status = "stale";
+                        else internal_status = "valid";
+
+                        const char* humidity_status = "unknown";
+                        if (!humidity_has_state) humidity_status = "unknown";
+                        else if (!humidity_number_valid) humidity_status = "invalid";
+                        else if (!humidity_fresh) humidity_status = "stale";
+                        else humidity_status = "valid";
+
+                        const char* soc_status = "unavailable";
+                        if (!internal_has_state) soc_status = "unknown";
+                        else if (!internal_number_valid) soc_status = "invalid";
+                        else if (!internal_fresh) soc_status = "stale";
+                        else if (!soc_has_state) soc_status = "unknown";
+                        else if (!soc_number_valid) soc_status = "invalid";
+                        else if (soc_valid) soc_status = "valid";
+
+                        root["schema_version"] = 1;
+                        root["mode"] = mode.c_str();
+                        root["debug_mode"] = id(debug_mode);
+                        root["temperature_source"] = id(debug_mode) ? "FAKE" : "REAL";
+                        root["motion_state"] = motion_state_text;
+                        root["motion_state_code"] = id(motion_state);
+                        root["motion_fault"] = id(motion_fault);
+                        root["remote_discharge_enabled"] = id(remote_discharge_enabled);
+                        root["remote_setpoint_valid"] = id(remote_setpoint_valid);
+
+                        if (external_fresh) {
+                          root["indoor_temperature_c"] =
+                              lroundf(id(temp_used_external).state * 10.0f) / 10.0f;
+                        } else {
+                          root["indoor_temperature_c"] = nullptr;
+                        }
+
+                        if (internal_fresh) {
+                          root["brick_temperature_c"] =
+                              lroundf(id(temp_used_internal).state * 10.0f) / 10.0f;
+                        } else {
+                          root["brick_temperature_c"] = nullptr;
+                        }
+
+                        if (humidity_fresh) {
+                          root["humidity_percent"] =
+                              lroundf(id(humidity_room).state * 10.0f) / 10.0f;
+                        } else {
+                          root["humidity_percent"] = nullptr;
+                        }
+
+                        if (soc_valid) {
+                          root["stored_soc_percent"] =
+                              (int) lroundf(id(stored_soc_percent).state);
+                        } else {
+                          root["stored_soc_percent"] = nullptr;
+                        }
+
+                        if (active_target_valid) {
+                          const float target = mode == "AUTO_REMOTO"
+                              ? id(remote_temp_target)
+                              : id(temp_target).state;
+                          root["target_temperature_c"] =
+                              lroundf(target * 10.0f) / 10.0f;
+                        } else {
+                          root["target_temperature_c"] = nullptr;
+                        }
+
+                        root["damper_level_commanded"] = id(saved_level);
+
+                        const int steps5 = atoi("${steps_level_5}");
+                        if (steps5 > 0) {
+                          float damper_pct =
+                              ((float) id(motor).current_position * 100.0f) / steps5;
+                          if (damper_pct < 0.0f) damper_pct = 0.0f;
+                          if (damper_pct > 100.0f) damper_pct = 100.0f;
+                          root["damper_position_percent"] = (int) lroundf(damper_pct);
+                        } else {
+                          root["damper_position_percent"] = nullptr;
+                        }
+
+                        root["endstop_closed"] = id(endstop_closed).state;
+                        root["endstop_open"] = id(endstop_open).state;
+
+                        root["quality"]["indoor_temperature"] = external_status;
+                        root["quality"]["brick_temperature"] = internal_status;
+                        root["quality"]["humidity"] = humidity_status;
+                        root["quality"]["stored_soc"] = soc_status;
+                        root["quality"]["target_temperature"] =
+                            mode == "MANUAL" ? "not_applicable"
+                            : (active_target_valid ? "valid" : "invalid");
                 else:
                   - logger.log:
                       level: DEBUG
@@ -727,6 +854,14 @@ sensor:
         - sliding_window_moving_average:
             window_size: 6
             send_every: 1
+      on_value:
+        then:
+          - lambda: |-
+              if (isnan(x)) {
+                id(last_humidity_valid_ms) = 0;
+              } else {
+                id(last_humidity_valid_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
+              }
     update_interval: 10s
 
   - platform: template
@@ -1187,6 +1322,7 @@ interval:
           const uint32_t period_ms = (uint32_t) lroundf(configured_period * 1000.0f);
 
           if (id(last_telemetry_ms) != 0 && now - id(last_telemetry_ms) < period_ms) return;
+          if (!id(mqtt_client)->is_connected()) return;
 
           id(last_telemetry_ms) = now;
-          id(publish_remote_telemetry)->execute();
+          id(publish_telemetry_snapshot)->execute();
