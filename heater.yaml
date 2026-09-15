@@ -6,6 +6,7 @@ substitutions:
 
   # ---- Calibración mecánica ----
   steps_level_5: "2500"   # recorrido estimado; solo se usa para buscar los endstops
+  debug_step_size: "100"  # pasos por pulsación de los botones de depuración
 
   # ---- Control térmico ----
   temp_target_default: "21.0"
@@ -342,6 +343,44 @@ script:
           id(saved_level) = level;
           id(level_reported).publish_state(level);
           id(level_manual).publish_state(level);
+
+  # Movimiento relativo para depurar el motor. Un valor positivo abre y uno
+  # negativo cierra. Solo está disponible mientras DEBUG mantiene liberado el
+  # movimiento; al salir de DEBUG se fuerza una nueva recalibración.
+  - id: debug_move_steps
+    mode: restart
+    parameters:
+      direction: int
+    then:
+      - lambda: |-
+          if (!id(debug_mode) || !id(debug_motion_override)) {
+            ESP_LOGW("DEBUG", "Movimiento ignorado: activa Debug Mode");
+            return;
+          }
+
+          if (id(motion_fault) || id(motion_state) != 0) {
+            ESP_LOGW("DEBUG", "Movimiento ignorado: motor no está READY");
+            return;
+          }
+
+          const int configured_steps = atoi("${debug_step_size}");
+          if (configured_steps <= 0) {
+            ESP_LOGE("DEBUG", "debug_step_size debe ser mayor que cero");
+            return;
+          }
+
+          const int sign = direction < 0 ? -1 : 1;
+          if ((sign > 0 && id(endstop_open).state) ||
+              (sign < 0 && id(endstop_closed).state)) {
+            ESP_LOGW("DEBUG", "Movimiento ignorado: endstop en la dirección solicitada");
+            return;
+          }
+
+          const long current = (long) id(motor).current_position;
+          const long target = current + (long) sign * configured_steps;
+          id(motor).set_target((int) target);
+          ESP_LOGW("DEBUG", "Movimiento manual: pos=%ld -> target=%ld (%d pasos)",
+                   current, target, sign * configured_steps);
 
   # Fuerza el cierre solo cuando el modo remoto no tiene permiso completo.
   # Durante HOMING dejamos que el motor termine de buscar el final cerrado.
@@ -1244,6 +1283,26 @@ number:
           id(last_telemetry_ms) = 0;
 
 button:
+  - platform: template
+    name: "DEBUG: mover + pasos (abrir)"
+    icon: "mdi:arrow-right-bold"
+    entity_category: diagnostic
+    on_press:
+      then:
+        - script.execute:
+            id: debug_move_steps
+            direction: 1
+
+  - platform: template
+    name: "DEBUG: mover - pasos (cerrar)"
+    icon: "mdi:arrow-left-bold"
+    entity_category: diagnostic
+    on_press:
+      then:
+        - script.execute:
+            id: debug_move_steps
+            direction: -1
+
   - platform: template
     name: "Marcar posición actual como Nivel 0"
     icon: "mdi:target"
