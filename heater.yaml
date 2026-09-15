@@ -909,7 +909,7 @@ sensor:
     accuracy_decimals: 1
     update_interval: 10s
     filters:
-      - offset: 0.2
+      - offset: 1.1
       - sliding_window_moving_average:
           window_size: 6
           send_every: 1
@@ -948,7 +948,7 @@ sensor:
       state_class: measurement
       accuracy_decimals: 1
       filters:
-        - offset: -1
+        - offset: -0.2
         - sliding_window_moving_average:
             window_size: 6
             send_every: 1
