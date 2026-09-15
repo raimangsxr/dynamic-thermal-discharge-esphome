@@ -210,6 +210,13 @@ globals:
     restore_value: false
     initial_value: "false"
 
+  # DEBUG puede liberar temporalmente el movimiento para diagnosticar el motor.
+  # Al salir de DEBUG se exige una nueva recalibración.
+  - id: debug_motion_override
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
   # Estado recibido por MQTT en AUTO_REMOTO.
   - id: remote_discharge_enabled
     type: bool
@@ -260,6 +267,12 @@ globals:
     restore_value: false
     initial_value: "0"
 
+  # Último porcentaje publicado; evita repetir el mismo estado en cada ciclo.
+  - id: last_open_percent
+    type: int
+    restore_value: false
+    initial_value: "-1"
+
   # Persistencia de nivel (último nivel comandado)
   - id: saved_level
     type: int
@@ -302,14 +315,15 @@ script:
           if (level < 0) level = 0;
           if (level > 5) level = 5;
 
-          if (id(motion_fault) || id(motion_state) == 3) {
+          if (!id(debug_motion_override) && (id(motion_fault) || id(motion_state) == 3)) {
             ESP_LOGE("POS", "Movimiento bloqueado: requiere recalibracion");
             return;
           }
 
           // En AUTO_REMOTO, el estado MQTT remoto tiene prioridad y fuerza
           // el nivel 0 mientras no haya permiso y setpoint válidos.
-          if (id(operating_mode).current_option() == "AUTO_REMOTO" &&
+          if (!id(debug_motion_override) &&
+              id(operating_mode).current_option() == "AUTO_REMOTO" &&
               (!id(remote_discharge_enabled) || !id(remote_setpoint_valid))) {
             level = 0;
           }
@@ -332,6 +346,7 @@ script:
     then:
       - lambda: |-
           if (id(operating_mode).current_option() != "AUTO_REMOTO") return;
+          if (id(debug_motion_override)) return;
           if (id(motion_fault) || id(motion_state) == 3) {
             ESP_LOGE("MQTT", "Cierre remoto bloqueado: requiere recalibracion");
             return;
@@ -557,6 +572,25 @@ script:
           id(motor).report_position(steps);
           id(motor).set_target(steps);
 
+  # Publica el porcentaje solo cuando cambia; el ciclo de comprobación es de 1 Hz.
+  - id: publish_open_percent
+    mode: restart
+    then:
+      - lambda: |-
+          const int steps5 = atoi("${steps_level_5}");
+          int pct = 0;
+          if (steps5 > 0) {
+            float value = ((float) id(motor).current_position * 100.0f) / steps5;
+            if (value < 0.0f) value = 0.0f;
+            if (value > 100.0f) value = 100.0f;
+            pct = (int) lroundf(value);
+          }
+
+          if (pct != id(last_open_percent)) {
+            id(last_open_percent) = pct;
+            id(open_percent).publish_state(pct);
+          }
+
   # Inicia homing hacia cerrado (nivel 0). Si ya está cerrado, dispara directamente “cerrado alcanzado”.
   - id: home_to_closed
     mode: restart
@@ -573,12 +607,22 @@ script:
           then:
             - script.execute: on_closed_endstop
           else:
+            - lambda: |-
+                const int steps5 = atoi("${steps_level_5}");
+                const int extra = atoi("${homing_extra_steps}");
+                const int travel = steps5 + extra;
+                const long current = (long) id(motor).current_position;
+                const long target = current - travel;
+                ESP_LOGW("HOME", "Homing: pos=%ld -> target=%ld (%d pasos); cerrado=%s abierto=%s",
+                         current, target, travel,
+                         id(endstop_closed).state ? "ON" : "OFF",
+                         id(endstop_open).state ? "ON" : "OFF");
             - stepper.set_target:
                 id: motor
                 target: !lambda |-
                   const int steps5 = atoi("${steps_level_5}");
                   const int extra = atoi("${homing_extra_steps}");
-                  return -(steps5 + extra);
+                  return id(motor).current_position - (steps5 + extra);
 
   # Handler del endstop cerrado:
   # - en AUTO_REMOTO: termina en 0 y espera el permiso/setpoint MQTT
@@ -789,6 +833,7 @@ sensor:
   - platform: dallas_temp
     name: "Temperatura Ladrillos (real)"
     id: temp_ladrillos
+    icon: "mdi:temperature-celsius"
     accuracy_decimals: 1
     update_interval: 10s
     filters:
@@ -824,6 +869,7 @@ sensor:
     temperature:
       id: temp_room
       name: "Temperatura Habitación (real)"
+      icon: "mdi:temperature-celsius"
       accuracy_decimals: 1
       filters:
         - offset: -1
@@ -849,6 +895,8 @@ sensor:
     humidity:
       id: humidity_room
       name: "Humedad Habitación (real)"
+      icon: "mdi:water-percent"
+      unit_of_measurement: "%"
       accuracy_decimals: 1
       filters:
         - sliding_window_moving_average:
@@ -867,16 +915,19 @@ sensor:
   - platform: template
     name: "Temperatura ambiente usada"
     id: temp_used_external
+    icon: "mdi:temperature-celsius"
     accuracy_decimals: 1
 
   - platform: template
     name: "Temperatura ladrillos usada"
     id: temp_used_internal
+    icon: "mdi:temperature-celsius"
     accuracy_decimals: 1
 
   - platform: template
     name: "Nivel Descarga (reportado)"
     id: level_reported
+    icon: "mdi:arrow-collapse"
     accuracy_decimals: 0
 
   - platform: template
@@ -884,26 +935,20 @@ sensor:
     id: open_percent
     unit_of_measurement: "%"
     accuracy_decimals: 0
-    update_interval: 1s
-    lambda: |-
-      const int steps5 = atoi("${steps_level_5}");
-      if (steps5 <= 0) return 0.0f;
-
-      float pct = ((float) id(motor).current_position * 100.0f) / steps5;
-      if (pct < 0.0f) pct = 0.0f;
-      if (pct > 100.0f) pct = 100.0f;
-      return lroundf(pct);
+    update_interval: never
 
   - platform: template
     name: "Carga acumulador (%)"
     id: stored_soc_percent
     unit_of_measurement: "%"
     accuracy_decimals: 0
+    icon: "mdi:battery"
 
   - platform: template
     name: "Temperatura objetivo remota"
     id: remote_temp_target_sensor
     accuracy_decimals: 1
+    icon: "mdi:temperature-celsius"
 
 # -------------------- Stepper NEMA17 + TMC2209 (STEP/DIR) --------------------
 stepper:
@@ -926,16 +971,31 @@ stepper:
 # -------------------- Controles HA --------------------
 switch:
   - platform: template
-    name: "Debug (usar Fake Temp)"
+    name: "Debug Mode"
     id: debug_switch
+    icon: "mdi:test-tube"
     lambda: |-
       return id(debug_mode);
     turn_on_action:
       - lambda: |-
           id(debug_mode) = true;
+          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+          const bool motion_locked = id(motion_fault) || id(motion_state) != 0;
+          id(debug_motion_override) = true;
+
+          // Permite mover para diagnóstico incluso después del FAULT del watchdog.
+          // Se detiene cualquier homing/restore pendiente y se invalida la posición
+          // al salir de DEBUG, para obligar a recalibrar antes de volver a operar.
+          if (motion_locked) {
+            id(motor).set_target(id(motor).current_position);
+            id(motion_fault) = false;
+            id(motion_state) = 0;
+            id(motion_state_since_ms) = now;
+            ESP_LOGW("CTRL", "DEBUG ON: bloqueo de movimiento liberado; recalibrar al terminar");
+          }
+
           id(temp_used_external).publish_state(id(fake_external_temp).state);
           id(temp_used_internal).publish_state(id(fake_internal_temp).state);
-          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
           id(last_temp_external_valid_ms) = now;
           id(last_temp_internal_valid_ms) = now;
           ESP_LOGW("CTRL", "DEBUG ON");
@@ -944,6 +1004,14 @@ switch:
       - lambda: |-
           id(debug_mode) = false;
           const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+          if (id(debug_motion_override)) {
+            id(motor).set_target(id(motor).current_position);
+            id(motion_fault) = true;
+            id(motion_state) = 3;
+            id(motion_state_since_ms) = now;
+            id(debug_motion_override) = false;
+            ESP_LOGW("CTRL", "DEBUG OFF: motor bloqueado hasta ejecutar una nueva recalibracion");
+          }
           if (id(temp_room).has_state() && !isnan(id(temp_room).state)) {
             id(temp_used_external).publish_state(id(temp_room).state);
             id(last_temp_external_valid_ms) = now;
@@ -990,6 +1058,7 @@ number:
   - platform: template
     name: "Temperatura objetivo"
     id: temp_target
+    icon: "mdi:temperature-celsius"
     min_value: ${temp_target_min}
     max_value: ${temp_target_max}
     step: 0.1
@@ -1003,6 +1072,7 @@ number:
   - platform: template
     name: "Fake Room Temp"
     id: fake_external_temp
+    icon: "mdi:temperature-celsius"
     min_value: 10
     max_value: 35
     step: 0.5
@@ -1019,6 +1089,7 @@ number:
   - platform: template
     name: "Fake Ladrillos Temp"
     id: fake_internal_temp
+    icon: "mdi:temperature-celsius"
     min_value: 20
     max_value: 200
     step: 1
@@ -1040,6 +1111,7 @@ number:
   - platform: template
     name: "Temperatura ladrillos al 0% de carga"
     id: brick_temp_soc_min
+    icon: "mdi:temperature-celsius"
     unit_of_measurement: "°C"
     min_value: 0
     max_value: 300
@@ -1053,6 +1125,7 @@ number:
   - platform: template
     name: "Temperatura ladrillos al 100% de carga"
     id: brick_temp_soc_max
+    icon: "mdi:temperature-celsius"
     unit_of_measurement: "°C"
     min_value: 0
     max_value: 300
@@ -1066,6 +1139,7 @@ number:
   - platform: template
     name: "Nivel Descarga (manual)"
     id: level_manual
+    icon: "mdi:arrow-collapse"
     min_value: 0
     max_value: 5
     step: 1
@@ -1077,13 +1151,13 @@ number:
             if (lvl < 0) lvl = 0;
             if (lvl > 5) lvl = 5;
 
-            if (id(motion_fault) || id(motion_state) != 0) {
+            if (!id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0)) {
               ESP_LOGW("MANUAL", "Ignorado: movimiento no disponible");
               id(level_manual).publish_state(id(saved_level));
               return;
             }
 
-            if (id(operating_mode).current_option() != "MANUAL") {
+            if (!id(debug_motion_override) && id(operating_mode).current_option() != "MANUAL") {
               ESP_LOGW("MANUAL", "Ignorado: modo=%s (pedido=%d)", id(operating_mode).current_option().c_str(), lvl);
               id(level_manual).publish_state(id(saved_level));
               return;
@@ -1094,6 +1168,7 @@ number:
   - platform: template
     name: "Periodo control automático"
     id: auto_period_in_seconds
+    icon: "mdi:timer-outline"
     unit_of_measurement: "s"
     min_value: 10
     max_value: 300
@@ -1108,6 +1183,7 @@ number:
   - platform: template
     name: "Periodo telemetría MQTT"
     id: mqtt_telemetry_period_in_seconds
+    icon: "mdi:timer-outline"
     unit_of_measurement: "s"
     min_value: 5
     max_value: 600
@@ -1127,7 +1203,7 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL";'
+              lambda: 'return !id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL");'
             then:
               - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
@@ -1145,7 +1221,7 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL";'
+              lambda: 'return !id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL");'
             then:
               - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
@@ -1160,7 +1236,7 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL";'
+              lambda: 'return !id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL");'
             then:
               - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
@@ -1179,6 +1255,7 @@ button:
             if (lvl > 5) lvl = 5;
             id(boot_restore_level) = lvl;
 
+            id(debug_motion_override) = false;
             id(motion_fault) = false;
             id(motion_state) = 1;
             id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
@@ -1208,6 +1285,20 @@ interval:
             }
           }
 
+          // Llegar al límite de pasos durante HOMING sin activar el endstop
+          // cerrado es un fallo de referencia, no un homing válido.
+          if (id(motion_state) == 1 &&
+              id(motor).current_position == id(motor).target_position) {
+            ESP_LOGE("HOME", "Homing finalizo sin activar endstop cerrado: pos=%ld target=%ld; revisar sentido, cableado/endstop y motor/driver.",
+                     (long) id(motor).current_position,
+                     (long) id(motor).target_position);
+            id(motion_fault) = true;
+            id(motion_state) = 3;
+            id(motion_state_since_ms) = now;
+            id(last_auto_ms) = now;
+            return;
+          }
+
           // Timeout seguridad (para HOMING o RESTORING)
           if (elapsed > timeout_ms) {
             ESP_LOGE("BOOT", "Timeout motion_state=%d (%ums). Paro motor; requiere recalibracion.", id(motion_state), (unsigned)elapsed);
@@ -1216,6 +1307,11 @@ interval:
             id(motion_state) = 3;  // FAULT: nunca se desbloquea sin homing correcto
             id(last_auto_ms) = now;
           }
+
+  # Actualiza el porcentaje como máximo una vez por segundo y solo si cambia.
+  - interval: 1s
+    then:
+      - script.execute: publish_open_percent
 
   # Expiración del permiso remoto: obliga al controlador a renovar sus órdenes.
   - interval: 1s
@@ -1242,6 +1338,7 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
+          if (id(debug_motion_override)) return;
           if (id(motion_state) != 0 || id(motion_fault)) return;
 
           const bool auto_local = id(operating_mode).current_option() == "AUTO_LOCAL";
