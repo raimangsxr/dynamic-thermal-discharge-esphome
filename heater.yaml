@@ -5,7 +5,7 @@ substitutions:
   #wg_private_ip: "10.8.0.23"
 
   # ---- Calibración mecánica ----
-  steps_level_5: "2500"   # pasos desde nivel 0 (cerrado) a nivel 5 (abierto)
+  steps_level_5: "2500"   # recorrido estimado; solo se usa para buscar los endstops
 
   # ---- Control térmico ----
   temp_target_default: "21.0"
@@ -53,13 +53,10 @@ esphome:
             id(last_temp_internal_valid_ms) = now;
           }
 
-          // Nivel a restaurar tras homing (en boot o recalibración)
-          id(boot_restore_level) = lvl;
-
-          ESP_LOGW("BOOT", "Boot: homing a cerrado; AUTO_REMOTO esperara MQTT antes de abrir (nivel=%d)", lvl);
+          ESP_LOGW("BOOT", "Boot: calibro recorrido abierto->cerrado y termino cerrado");
 
           // Bloquea auto/manual hasta terminar secuencia
-          id(motion_state) = 1;  // 0=READY, 1=HOMING, 2=RESTORING, 3=FAULT
+          id(motion_state) = 1;  // 0=READY, 1=HOMING, 3=FAULT
           id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
 
       - delay: 500ms
@@ -279,14 +276,21 @@ globals:
     restore_value: true
     initial_value: "0"
 
-  # Nivel que se restaura tras homing (boot/recalibración)
-  - id: boot_restore_level
+  # Recorrido real entre ambos endstops. Se actualiza en cada homing y se
+  # conserva como referencia para poder alcanzar el primer endstop al arrancar.
+  - id: calibrated_steps_level_5
+    type: int
+    restore_value: true
+    initial_value: "${steps_level_5}"
+
+  # Fase del homing: 0=buscando abierto, 1=midiendo hacia cerrado.
+  - id: homing_phase
     type: int
     restore_value: false
     initial_value: "0"
 
   # Estado de movimiento:
-  # 0=READY, 1=HOMING, 2=RESTORING, 3=FAULT (requiere recalibración)
+  # 0=READY, 1=HOMING, 3=FAULT (requiere recalibración)
   - id: motion_state
     type: int
     restore_value: false
@@ -328,7 +332,7 @@ script:
             level = 0;
           }
 
-          const int steps5 = atoi("${steps_level_5}");
+          const int steps5 = id(calibrated_steps_level_5);
           const int target_steps = (int) lroundf(level * (steps5 / 5.0f));
 
           ESP_LOGI("POS", "set_level(%d) -> target_steps=%d", level, target_steps);
@@ -455,7 +459,6 @@ script:
                         switch (id(motion_state)) {
                           case 0: motion_state_text = "READY"; break;
                           case 1: motion_state_text = "HOMING"; break;
-                          case 2: motion_state_text = "RESTORING"; break;
                           case 3: motion_state_text = "FAULT"; break;
                         }
 
@@ -534,8 +537,9 @@ script:
                         }
 
                         root["damper_level_commanded"] = id(saved_level);
+                        root["damper_travel_steps"] = id(calibrated_steps_level_5);
 
-                        const int steps5 = atoi("${steps_level_5}");
+                        const int steps5 = id(calibrated_steps_level_5);
                         if (steps5 > 0) {
                           float damper_pct =
                               ((float) id(motor).current_position * 100.0f) / steps5;
@@ -577,7 +581,7 @@ script:
     mode: restart
     then:
       - lambda: |-
-          const int steps5 = atoi("${steps_level_5}");
+          const int steps5 = id(calibrated_steps_level_5);
           int pct = 0;
           if (steps5 > 0) {
             float value = ((float) id(motor).current_position * 100.0f) / steps5;
@@ -591,89 +595,111 @@ script:
             id(open_percent).publish_state(pct);
           }
 
-  # Inicia homing hacia cerrado (nivel 0). Si ya está cerrado, dispara directamente “cerrado alcanzado”.
+  # Calibra el recorrido completo: primero busca abierto y desde ahí mide hasta
+  # cerrado. Acaba siempre en 0 para dejar la trampilla en una posición segura.
   - id: home_to_closed
     mode: restart
     then:
       - lambda: |-
           id(motion_fault) = false;
           id(motion_state) = 1; // HOMING
+          id(homing_phase) = 0; // primero buscar ABIERTO
           id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
-          ESP_LOGW("HOME", "Homing hacia cerrado...");
+          ESP_LOGW("HOME", "Homing: primero busco el endstop abierto");
 
       - if:
           condition:
-            binary_sensor.is_on: endstop_closed
+            binary_sensor.is_on: endstop_open
           then:
-            - script.execute: on_closed_endstop
+            - script.execute: on_open_endstop
           else:
             - lambda: |-
-                const int steps5 = atoi("${steps_level_5}");
+                const int estimated = atoi("${steps_level_5}");
+                const int calibrated = id(calibrated_steps_level_5);
                 const int extra = atoi("${homing_extra_steps}");
-                const int travel = steps5 + extra;
+                const int travel = std::max(estimated, calibrated) + extra;
                 const long current = (long) id(motor).current_position;
-                const long target = current - travel;
-                ESP_LOGW("HOME", "Homing: pos=%ld -> target=%ld (%d pasos); cerrado=%s abierto=%s",
+                const long target = current + travel;
+                ESP_LOGW("HOME", "Buscando abierto: pos=%ld -> target=%ld (%d pasos); cerrado=%s abierto=%s",
                          current, target, travel,
                          id(endstop_closed).state ? "ON" : "OFF",
                          id(endstop_open).state ? "ON" : "OFF");
             - stepper.set_target:
                 id: motor
                 target: !lambda |-
-                  const int steps5 = atoi("${steps_level_5}");
+                  const int estimated = atoi("${steps_level_5}");
+                  const int calibrated = id(calibrated_steps_level_5);
                   const int extra = atoi("${homing_extra_steps}");
-                  return id(motor).current_position - (steps5 + extra);
+                  return id(motor).current_position + std::max(estimated, calibrated) + extra;
 
   # Handler del endstop cerrado:
-  # - en AUTO_REMOTO: termina en 0 y espera el permiso/setpoint MQTT
-  # - en otros modos: restaura boot_restore_level como antes
+  # - en la segunda fase de HOMING: calcula el recorrido real y termina en 0
   # - si estamos en normal: ancla a 0 y fija nivel 0 (sin “restore”)
   - id: on_closed_endstop
     mode: restart
     then:
-      - lambda: |-
-          const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-
-          // Ancla físico -> pasos 0
-          ESP_LOGW("ENDSTOP", "CERRADO activado (motion_state=%d) -> anchor a 0", id(motion_state));
-          id(last_auto_ms) = now; // evita auto inmediato cuando se libere
-
-      - script.execute:
-          id: anchor_steps
-          steps: 0
-
       - if:
           condition:
             lambda: 'return id(motion_state) == 1;'
           then:
             - if:
                 condition:
-                  lambda: 'return id(operating_mode).current_option() == "AUTO_REMOTO";'
+                  lambda: 'return id(homing_phase) == 1;'
                 then:
-                  - script.execute:
-                      id: set_level
-                      lvl: 0
                   - lambda: |-
-                      id(motion_state) = 0;
-                      id(last_auto_ms) = 0;
-                      ESP_LOGW("HOME", "Cerrado alcanzado en AUTO_REMOTO -> espero MQTT");
+                      const int measured = -id(motor).current_position;
+                      if (measured <= 0) {
+                        const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                        id(motor).set_target(id(motor).current_position);
+                        id(motion_fault) = true;
+                        id(motion_state) = 3;
+                        id(motion_state_since_ms) = now;
+                        id(last_auto_ms) = now;
+                        ESP_LOGE("HOME", "Recorrido medido invalido: %d pasos", measured);
+                        return;
+                      }
+
+                      id(calibrated_steps_level_5) = measured;
+                      id(calibrated_travel_sensor).publish_state(measured);
+                      ESP_LOGW("HOME", "Cerrado alcanzado: recorrido calibrado=%d pasos", measured);
+                  - if:
+                      condition:
+                        lambda: 'return !id(motion_fault);'
+                      then:
+                        - script.execute:
+                            id: anchor_steps
+                            steps: 0
+                        - lambda: |-
+                            const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                            id(motion_state) = 0;
+                            id(saved_level) = 0;
+                            id(level_reported).publish_state(0);
+                            id(level_manual).publish_state(0);
+                            id(last_auto_ms) = now;
+                            ESP_LOGW("HOME", "Homing completado -> READY, trampilla cerrada");
+                        - script.execute: publish_open_percent
                 else:
                   - lambda: |-
-                      const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-                      id(motion_state) = 2; // RESTORING
-                      id(motion_state_since_ms) = now;
-                      ESP_LOGW("HOME", "Cerrado alcanzado -> restauro nivel=%d", id(boot_restore_level));
-                  - script.execute:
-                      id: set_level
-                      lvl: !lambda 'return id(boot_restore_level);'
+                      // Puede ocurrir al arrancar ya apoyado en el endstop cerrado.
+                      // La calibración debe continuar hacia abierto.
+                      ESP_LOGD("HOME", "Endstop cerrado activo mientras busco abierto; continuo");
           else:
+            - lambda: |-
+                const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                ESP_LOGW("ENDSTOP", "CERRADO activado (motion_state=%d) -> anchor a 0", id(motion_state));
+                id(last_auto_ms) = now;
+            - script.execute:
+                id: anchor_steps
+                steps: 0
             - script.execute:
                 id: set_level
                 lvl: 0
 
   # Handler del endstop abierto:
-  # - durante HOMING hacia cerrado: es el endstop contrario, por lo que para y marca FAULT
-  # - durante RESTORING/READY: ancla a steps5 y fija nivel 5
+  # - en la primera fase de HOMING: fija el origen temporal y empieza a medir
+  #   hacia cerrado
+  # - durante la segunda fase: es el endstop contrario y marca FAULT
+  # - en READY: ancla al recorrido calibrado y fija nivel 5
   - id: on_open_endstop
     mode: restart
     then:
@@ -681,14 +707,33 @@ script:
           condition:
             lambda: 'return id(motion_state) == 1;'
           then:
-            - lambda: |-
-                const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-                id(motor).set_target(id(motor).current_position);
-                id(motion_fault) = true;
-                id(motion_state) = 3;
-                id(motion_state_since_ms) = now;
-                id(last_auto_ms) = now;
-                ESP_LOGE("ENDSTOP", "ABIERTO activado durante HOMING a cerrado -> FAULT");
+            - if:
+                condition:
+                  lambda: 'return id(homing_phase) == 0;'
+                then:
+                  - lambda: |-
+                      const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                      id(motor).report_position(0);
+                      id(motor).set_target(0);
+                      id(homing_phase) = 1;
+                      id(motion_state_since_ms) = now;
+                      ESP_LOGW("HOME", "Abierto alcanzado; mido recorrido hacia cerrado");
+                  - stepper.set_target:
+                      id: motor
+                      target: !lambda |-
+                        const int estimated = atoi("${steps_level_5}");
+                        const int calibrated = id(calibrated_steps_level_5);
+                        const int extra = atoi("${homing_extra_steps}");
+                        return -(std::max(estimated, calibrated) + extra);
+                else:
+                  - lambda: |-
+                      const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
+                      id(motor).set_target(id(motor).current_position);
+                      id(motion_fault) = true;
+                      id(motion_state) = 3;
+                      id(motion_state_since_ms) = now;
+                      id(last_auto_ms) = now;
+                      ESP_LOGE("ENDSTOP", "ABIERTO reactivado mientras buscaba cerrado -> FAULT");
           else:
             - if:
                 condition:
@@ -701,21 +746,15 @@ script:
                   - lambda: |-
                       const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
                       id(last_auto_ms) = now;
-                      ESP_LOGW("ENDSTOP", "ABIERTO activado (motion_state=%d) -> anchor a 5", id(motion_state));
+                      ESP_LOGW("ENDSTOP", "ABIERTO activado (motion_state=%d) -> anchor a recorrido calibrado", id(motion_state));
 
                   - script.execute:
                       id: anchor_steps
-                      steps: !lambda 'return atoi("${steps_level_5}");'
+                      steps: !lambda 'return id(calibrated_steps_level_5);'
 
                   - script.execute:
                       id: set_level
                       lvl: 5
-
-                  - lambda: |-
-                      if (id(motion_state) == 2) {
-                        id(motion_state) = 0;
-                        ESP_LOGW("BOOT", "Restore completado por endstop abierto -> READY");
-                      }
 
 # -------------------- Binary sensors --------------------
 binary_sensor:
@@ -938,6 +977,15 @@ sensor:
     update_interval: never
 
   - platform: template
+    name: "Recorrido calibrado de trampilla"
+    id: calibrated_travel_sensor
+    unit_of_measurement: "steps"
+    icon: "mdi:ruler"
+    accuracy_decimals: 0
+    update_interval: never
+    entity_category: diagnostic
+
+  - platform: template
     name: "Carga acumulador (%)"
     id: stored_soc_percent
     unit_of_measurement: "%"
@@ -984,7 +1032,7 @@ switch:
           id(debug_motion_override) = true;
 
           // Permite mover para diagnóstico incluso después del FAULT del watchdog.
-          // Se detiene cualquier homing/restore pendiente y se invalida la posición
+          // Se detiene cualquier homing pendiente y se invalida la posición
           // al salir de DEBUG, para obligar a recalibrar antes de volver a operar.
           if (motion_locked) {
             id(motor).set_target(id(motor).current_position);
@@ -1245,27 +1293,22 @@ button:
                   lvl: 5
 
   - platform: template
-    name: "Recalibrar (Homing a Cerrado)"
+    name: "Recalibrar recorrido (5 -> 0)"
     icon: "mdi:home-import-outline"
     on_press:
       then:
         - lambda: |-
-            int lvl = id(saved_level);
-            if (lvl < 0) lvl = 0;
-            if (lvl > 5) lvl = 5;
-            id(boot_restore_level) = lvl;
-
             id(debug_motion_override) = false;
             id(motion_fault) = false;
             id(motion_state) = 1;
             id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
 
-            ESP_LOGW("HOME", "Recalibrar: homing a cerrado y restauro nivel=%d", lvl);
+            ESP_LOGW("HOME", "Recalibrar: busco abierto, mido hasta cerrado y termino en 0");
         - script.execute: home_to_closed
 
-# -------------------- Supervisión de homing/restore + AUTO control --------------------
+# -------------------- Supervisión de homing + AUTO control --------------------
 interval:
-  # Watchdog de movimiento: libera lock cuando termina restore (o por timeout)
+  # Watchdog de movimiento durante las dos fases del homing.
   - interval: 250ms
     then:
       - lambda: |-
@@ -1275,21 +1318,13 @@ interval:
           const uint32_t elapsed = now - id(motion_state_since_ms);
           const uint32_t timeout_ms = (uint32_t)(atoi("${motion_timeout_s}") * 1000UL);
 
-          // Si estamos RESTORING y llegamos al target, liberamos.
-          if (id(motion_state) == 2) {
-            if (id(motor).current_position == id(motor).target_position) {
-              id(motion_state) = 0;
-              id(last_auto_ms) = now;
-              ESP_LOGW("BOOT", "Restore completado -> READY (lvl=%d)", id(saved_level));
-              return;
-            }
-          }
-
           // Llegar al límite de pasos durante HOMING sin activar el endstop
-          // cerrado es un fallo de referencia, no un homing válido.
+          // esperado en cada fase es un fallo de referencia.
           if (id(motion_state) == 1 &&
               id(motor).current_position == id(motor).target_position) {
-            ESP_LOGE("HOME", "Homing finalizo sin activar endstop cerrado: pos=%ld target=%ld; revisar sentido, cableado/endstop y motor/driver.",
+            const char *expected = id(homing_phase) == 0 ? "abierto" : "cerrado";
+            ESP_LOGE("HOME", "Homing finalizo sin activar endstop %s: pos=%ld target=%ld; revisar sentido, cableado/endstop y motor/driver.",
+                     expected,
                      (long) id(motor).current_position,
                      (long) id(motor).target_position);
             id(motion_fault) = true;
@@ -1299,7 +1334,7 @@ interval:
             return;
           }
 
-          // Timeout seguridad (para HOMING o RESTORING)
+          // Timeout de seguridad para cada fase del HOMING.
           if (elapsed > timeout_ms) {
             ESP_LOGE("BOOT", "Timeout motion_state=%d (%ums). Paro motor; requiere recalibracion.", id(motion_state), (unsigned)elapsed);
             id(motor).set_target(id(motor).current_position);  // stop suave
