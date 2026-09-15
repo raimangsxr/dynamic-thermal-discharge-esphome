@@ -1,7 +1,7 @@
 substitutions:
-  name: "heater-entrada"
-  friendly_name: "Acumulador Entrada Test"
-  lan_private_ip: "192.168.11.102"
+  name: "habitaciones"
+  friendly_name: "Acumulador Habitaciones Test"
+  lan_private_ip: "192.168.11.104"
   #wg_private_ip: "10.8.0.23"
 
   # ---- Calibración mecánica ----
