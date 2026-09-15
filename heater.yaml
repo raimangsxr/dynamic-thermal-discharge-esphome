@@ -208,13 +208,6 @@ globals:
     restore_value: false
     initial_value: "false"
 
-  # DEBUG puede liberar temporalmente el movimiento para diagnosticar el motor.
-  # Al salir de DEBUG se exige una nueva recalibración.
-  - id: debug_motion_override
-    type: bool
-    restore_value: false
-    initial_value: "false"
-
   # Estado recibido por MQTT en AUTO_REMOTO.
   - id: remote_discharge_enabled
     type: bool
@@ -320,15 +313,14 @@ script:
           if (level < 0) level = 0;
           if (level > 5) level = 5;
 
-          if (!id(debug_motion_override) && (id(motion_fault) || id(motion_state) == 3)) {
+          if (id(motion_fault) || id(motion_state) == 3) {
             ESP_LOGE("POS", "Movimiento bloqueado: requiere recalibracion");
             return;
           }
 
           // En AUTO_REMOTO, el estado MQTT remoto tiene prioridad y fuerza
           // el nivel 0 mientras no haya permiso y setpoint válidos.
-          if (!id(debug_motion_override) &&
-              id(operating_mode).current_option() == "AUTO_REMOTO" &&
+          if (id(operating_mode).current_option() == "AUTO_REMOTO" &&
               (!id(remote_discharge_enabled) || !id(remote_setpoint_valid))) {
             level = 0;
           }
@@ -345,15 +337,15 @@ script:
           id(level_manual).publish_state(level);
 
   # Movimiento relativo para depurar el motor. Un valor positivo abre y uno
-  # negativo cierra. Solo está disponible mientras DEBUG mantiene liberado el
-  # movimiento; al salir de DEBUG se fuerza una nueva recalibración.
+  # negativo cierra. Solo está disponible mientras DEBUG está activo y el
+  # motor se encuentra READY; no modifica la calibración.
   - id: debug_move_steps
     mode: restart
     parameters:
       direction: int
     then:
       - lambda: |-
-          if (!id(debug_mode) || !id(debug_motion_override)) {
+          if (!id(debug_mode)) {
             ESP_LOGW("DEBUG", "Movimiento ignorado: activa Debug Mode");
             return;
           }
@@ -389,7 +381,6 @@ script:
     then:
       - lambda: |-
           if (id(operating_mode).current_option() != "AUTO_REMOTO") return;
-          if (id(debug_motion_override)) return;
           if (id(motion_fault) || id(motion_state) == 3) {
             ESP_LOGE("MQTT", "Cierre remoto bloqueado: requiere recalibracion");
             return;
@@ -1067,20 +1058,7 @@ switch:
       - lambda: |-
           id(debug_mode) = true;
           const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-          const bool motion_locked = id(motion_fault) || id(motion_state) != 0;
-          id(debug_motion_override) = true;
-
-          // Permite mover para diagnóstico incluso después del FAULT del watchdog.
-          // Se detiene cualquier homing pendiente y se invalida la posición
-          // al salir de DEBUG, para obligar a recalibrar antes de volver a operar.
-          if (motion_locked) {
-            id(motor).set_target(id(motor).current_position);
-            id(motion_fault) = false;
-            id(motion_state) = 0;
-            id(motion_state_since_ms) = now;
-            ESP_LOGW("CTRL", "DEBUG ON: bloqueo de movimiento liberado; recalibrar al terminar");
-          }
-
+          id(last_auto_ms) = 0;
           id(temp_used_external).publish_state(id(fake_external_temp).state);
           id(temp_used_internal).publish_state(id(fake_internal_temp).state);
           id(last_temp_external_valid_ms) = now;
@@ -1091,14 +1069,7 @@ switch:
       - lambda: |-
           id(debug_mode) = false;
           const uint32_t now = (uint32_t)(millis() & 0xFFFFFFFF);
-          if (id(debug_motion_override)) {
-            id(motor).set_target(id(motor).current_position);
-            id(motion_fault) = true;
-            id(motion_state) = 3;
-            id(motion_state_since_ms) = now;
-            id(debug_motion_override) = false;
-            ESP_LOGW("CTRL", "DEBUG OFF: motor bloqueado hasta ejecutar una nueva recalibracion");
-          }
+          id(last_auto_ms) = 0;
           if (id(temp_room).has_state() && !isnan(id(temp_room).state)) {
             id(temp_used_external).publish_state(id(temp_room).state);
             id(last_temp_external_valid_ms) = now;
@@ -1238,13 +1209,13 @@ number:
             if (lvl < 0) lvl = 0;
             if (lvl > 5) lvl = 5;
 
-            if (!id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0)) {
+            if (id(motion_fault) || id(motion_state) != 0) {
               ESP_LOGW("MANUAL", "Ignorado: movimiento no disponible");
               id(level_manual).publish_state(id(saved_level));
               return;
             }
 
-            if (!id(debug_motion_override) && id(operating_mode).current_option() != "MANUAL") {
+            if (id(operating_mode).current_option() != "MANUAL") {
               ESP_LOGW("MANUAL", "Ignorado: modo=%s (pedido=%d)", id(operating_mode).current_option().c_str(), lvl);
               id(level_manual).publish_state(id(saved_level));
               return;
@@ -1310,7 +1281,7 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return !id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL");'
+              lambda: 'return id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL";'
             then:
               - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
@@ -1328,7 +1299,7 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return !id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL");'
+              lambda: 'return id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL";'
             then:
               - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
@@ -1343,7 +1314,7 @@ button:
       then:
         - if:
             condition:
-              lambda: 'return !id(debug_motion_override) && (id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL");'
+              lambda: 'return id(motion_fault) || id(motion_state) != 0 || id(operating_mode).current_option() != "MANUAL";'
             then:
               - lambda: 'ESP_LOGW("MANUAL", "Ignorado: requiere modo MANUAL y motor listo");'
             else:
@@ -1357,7 +1328,6 @@ button:
     on_press:
       then:
         - lambda: |-
-            id(debug_motion_override) = false;
             id(motion_fault) = false;
             id(motion_state) = 1;
             id(motion_state_since_ms) = (uint32_t)(millis() & 0xFFFFFFFF);
@@ -1432,7 +1402,6 @@ interval:
   - interval: 1s
     then:
       - lambda: |-
-          if (id(debug_motion_override)) return;
           if (id(motion_state) != 0 || id(motion_fault)) return;
 
           const bool auto_local = id(operating_mode).current_option() == "AUTO_LOCAL";
