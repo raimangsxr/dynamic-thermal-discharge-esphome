@@ -903,6 +903,9 @@ sensor:
     name: "Temperatura Ladrillos (real)"
     id: temp_ladrillos
     icon: "mdi:temperature-celsius"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
     accuracy_decimals: 1
     update_interval: 10s
     filters:
@@ -910,6 +913,7 @@ sensor:
       - sliding_window_moving_average:
           window_size: 6
           send_every: 1
+      - round: 1
     on_value:
       then:
         - lambda: |-
@@ -939,12 +943,16 @@ sensor:
       id: temp_room
       name: "Temperatura Habitación (real)"
       icon: "mdi:temperature-celsius"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
       accuracy_decimals: 1
       filters:
         - offset: -1
         - sliding_window_moving_average:
             window_size: 6
             send_every: 1
+        - round: 1
       on_value:
         then:
           - lambda: |-
@@ -985,13 +993,23 @@ sensor:
     name: "Temperatura ambiente usada"
     id: temp_used_external
     icon: "mdi:temperature-celsius"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
     accuracy_decimals: 1
+    filters:
+      - round: 1
 
   - platform: template
     name: "Temperatura ladrillos usada"
     id: temp_used_internal
     icon: "mdi:temperature-celsius"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
     accuracy_decimals: 1
+    filters:
+      - round: 1
 
   - platform: template
     name: "Nivel Descarga (reportado)"
@@ -1025,8 +1043,12 @@ sensor:
   - platform: template
     name: "Temperatura objetivo remota"
     id: remote_temp_target_sensor
+    unit_of_measurement: "°C"
+    device_class: temperature
     accuracy_decimals: 1
     icon: "mdi:temperature-celsius"
+    filters:
+      - round: 1
 
 # -------------------- Stepper NEMA17 + TMC2209 (STEP/DIR) --------------------
 stepper:
