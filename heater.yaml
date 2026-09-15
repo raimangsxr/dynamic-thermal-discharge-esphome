@@ -955,13 +955,13 @@ stepper:
   - platform: a4988
     id: motor
     step_pin: GPIO19
-    dir_pin: GPIO20
+    dir_pin: GPIO18
 
     # En TMC2209 el pin es EN (ENABLE) en lugar de SLEEP.
     # ESPHome usa "sleep_pin" para dormir al terminar; en TMC hay que INVERTIRLO.
     # Con esto replicas tu "sleep_when_done: true" (se deshabilita al llegar al target).
     sleep_pin:
-      number: GPIO18
+      number: GPIO20
       inverted: true
 
     max_speed: 250 steps/s
