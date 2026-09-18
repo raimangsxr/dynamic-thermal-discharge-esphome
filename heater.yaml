@@ -10,8 +10,8 @@ substitutions:
 
   # ---- Control térmico ----
   temp_target_default: "21.0"
-  temp_target_min: "18"
-  temp_target_max: "25"
+  temp_target_min: "15"
+  temp_target_max: "30"
   hysteresis: "0.4"       # °C (banda muerta)
   step_band: "0.4"        # °C por nivel (agresividad)
 
